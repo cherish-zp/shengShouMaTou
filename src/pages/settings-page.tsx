@@ -7,6 +7,7 @@ import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
 import {
   ArrowRight,
   Cloud,
+  Heart,
   LoaderCircle,
   Monitor,
   Moon,
@@ -16,6 +17,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { useAppUpdater } from "@/composables/use-app-updater";
+import { StorageSection } from "@/components/settings/storage-section";
 import { UpdateSettingsSection } from "@/components/update/update-settings-section";
 
 import { Badge } from "@/components/ui/badge";
@@ -54,6 +56,7 @@ const THEME_OPTIONS = [
   { value: "system", icon: Monitor, labelKey: "settings.themeSystem" },
   { value: "light", icon: Sun, labelKey: "settings.themeLight" },
   { value: "dark", icon: Moon, labelKey: "settings.themeDark" },
+  { value: "pink", icon: Heart, labelKey: "settings.themePink" },
 ] as const;
 
 const LANGUAGE_LABELS: Record<AppLanguage, string> = {
@@ -135,7 +138,10 @@ export function SettingsPage() {
                   className={cn(
                     "inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-[13px] transition-all",
                     theme === value
-                      ? "bg-background text-foreground shadow-sm"
+                      ? value === "pink"
+                        ? // 少女粉激活态直接用玫粉视觉（pink 模式下 primary 即玫粉）
+                          "bg-primary text-primary-foreground shadow-sm"
+                        : "bg-background text-foreground shadow-sm"
                       : "text-muted-foreground hover:text-foreground",
                   )}
                 >
@@ -207,6 +213,9 @@ export function SettingsPage() {
             ))}
           </CardContent>
         </Card>
+
+        {/* Storage usage (logs / cache / app data) */}
+        <StorageSection />
       </div>
     </div>
   );
