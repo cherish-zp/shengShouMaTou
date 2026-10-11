@@ -14,6 +14,7 @@ mod servers_store;
 mod ssh;
 mod store;
 mod tray;
+mod util;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -74,6 +75,11 @@ pub fn run() {
             commands::get_server_status,
             commands::import_frpc_config,
             commands::diagnose_tunnel,
+            commands::get_tunnel_logs,
+            commands::clear_tunnel_logs,
+            commands::clear_all_tunnel_logs,
+            commands::get_storage_usage,
+            commands::clear_cache,
             commands::set_tunnel_auth,
             commands::cf_verify_token,
             commands::cf_list_zones,

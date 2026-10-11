@@ -21,6 +21,9 @@ import type {
   TunnelStateEvent,
   TunnelStats,
 } from "@/types/tunnel";
+import type { StorageUsage } from "@/types/storage";
+
+export type { StorageUsage };
 
 export const TUNNEL_STATE_EVENT = "tunnel://state";
 export const TUNNEL_LOG_EVENT = "tunnel://log";
@@ -67,6 +70,16 @@ export const api = {
     invoke<TunnelConfig>("cf_update_hostname", args),
   cfGetApiToken: (id: string) => invoke<string>("cf_get_api_token", { id }),
   cfListZonesStored: (id: string) => invoke<CfZone[]>("cf_list_zones_stored", { id }),
+
+  // Historical log replay for the log panel (oldest first).
+  getTunnelLogs: (tunnelId: string, limit?: number) =>
+    invoke<TunnelLogEvent[]>("get_tunnel_logs", { id: tunnelId, limit }),
+
+  // 日志清理 + 存储占用统计（clear 返回清掉的行数/释放的字节数）。
+  clearTunnelLogs: (id: string) => invoke<number>("clear_tunnel_logs", { id }),
+  clearAllTunnelLogs: () => invoke<number>("clear_all_tunnel_logs"),
+  getStorageUsage: () => invoke<StorageUsage>("get_storage_usage"),
+  clearCache: () => invoke<number>("clear_cache"),
 };
 
 export function onTunnelState(

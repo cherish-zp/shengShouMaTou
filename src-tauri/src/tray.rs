@@ -8,12 +8,17 @@
 //     (e.g. from a menu event handler) therefore deadlocks — it must only be
 //     called from non-main threads. All refreshes go through
 //     `request_refresh`, which spawns onto the async runtime first.
-//   * The engine emits `tunnel://state` from tokio worker threads, so the
-//     listener below never runs on the main thread either; the spawn makes
-//     that guarantee explicit.
+//   * Both triggers (`tunnel://state` from the engine's tokio workers and
+//     `tunnels://config-changed` from the command layer) arrive on arbitrary
+//     threads; the spawn below makes the "never on the main thread"
+//     guarantee explicit.
+//
+// Menu refresh is EVENT-DRIVEN: `tunnel://state` covers status changes,
+// `tunnels://config-changed` (emitted by commands.rs on every successful
+// tunnels.json mutation) covers create/rename/delete — the former 1s
+// fingerprint polling thread is gone.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
 use tauri::{
     menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
@@ -21,16 +26,13 @@ use tauri::{
     AppHandle, Listener, Manager,
 };
 
-use crate::commands::AppState;
+use crate::commands::{AppState, TUNNELS_CONFIG_EVENT};
 use crate::engine::TUNNEL_STATE_EVENT;
 use crate::models::{Backend, TunnelStatus};
 
 const TRAY_ID: &str = "pier-tray";
 /// Prefix for per-tunnel menu item ids: `<prefix><tunnel id>`.
 const TOGGLE_PREFIX: &str = "pier-toggle:";
-/// Poll interval for tunnel config changes (create/rename/delete do not emit
-/// status events, so the store is watched for fingerprint changes instead).
-const CONFIG_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Set while a menu refresh task is queued or running, to coalesce bursts of
 /// `tunnel://state` events into a single rebuild.
@@ -66,21 +68,13 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
         request_refresh(&state_handle);
     });
 
-    // Pick up tunnel config changes that never emit a status event.
-    let watch_handle = app.clone();
-    let _ = std::thread::Builder::new()
-        .name("pier-tray-menu-watch".into())
-        .spawn(move || {
-            let mut last = config_fingerprint(&watch_handle);
-            loop {
-                std::thread::sleep(CONFIG_POLL_INTERVAL);
-                let fingerprint = config_fingerprint(&watch_handle);
-                if fingerprint != last {
-                    last = fingerprint;
-                    request_refresh(&watch_handle);
-                }
-            }
-        });
+    // Config changes (create/rename/delete) never emit a status event; the
+    // command layer emits TUNNELS_CONFIG_EVENT on every successful
+    // tunnels.json mutation instead of the old polling thread.
+    let config_handle = app.clone();
+    app.listen(TUNNELS_CONFIG_EVENT, move |_event| {
+        request_refresh(&config_handle);
+    });
 
     Ok(())
 }
@@ -99,7 +93,8 @@ fn request_refresh(app: &AppHandle) {
 
 /// Rebuild the tray menu from the current store + engine state and swap it in.
 /// Must not be called from the main thread (see module docs).
-fn refresh_menu(app: &AppHandle) {    let Some(tray) = app.tray_by_id(TRAY_ID) else {
+fn refresh_menu(app: &AppHandle) {
+    let Some(tray) = app.tray_by_id(TRAY_ID) else {
         return;
     };
     match build_menu(app) {
@@ -110,14 +105,6 @@ fn refresh_menu(app: &AppHandle) {    let Some(tray) = app.tray_by_id(TRAY_ID) e
         }
         Err(e) => eprintln!("[pier] failed to build tray menu: {e}"),
     }
-}
-
-/// Stable description of the tunnel list, used to detect config changes that
-/// do not emit a status event (create / rename / delete of an idle tunnel).
-fn config_fingerprint(app: &AppHandle) -> String {
-    app.try_state::<AppState>()
-        .map(|state| serde_json::to_string(&state.store.load()).unwrap_or_default())
-        .unwrap_or_default()
 }
 
 /// Build the full menu: Open Pier | Tunnels submenu | Quit Pier.

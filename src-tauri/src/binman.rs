@@ -27,18 +27,12 @@
 //   name anywhere in the archive, so it sees through the wrapper directory.
 
 use std::ffi::OsStr;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use serde::Deserialize;
 use tauri::Manager;
 
 use crate::models::{Backend, BinaryInfo, BinaryStatus};
-
-const USER_AGENT: &str = concat!("Pier/", env!("CARGO_PKG_VERSION"), " (engine binary manager)");
-/// Only bounds the TCP/TLS handshake; the body has no timeout (big downloads).
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 const CLOUDFLARED_LATEST_URL: &str =
     "https://github.com/cloudflare/cloudflared/releases/latest/download";
@@ -364,35 +358,17 @@ struct GitHubAsset {
     browser_download_url: String,
 }
 
-async fn fetch_latest_github_release(api_url: &str, project: &str) -> Result<GitHubRelease, String> {
-    let resp = http_client()?
-        .get(api_url)
-        .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-        .map_err(|e| format!("request to {api_url} failed: {e}"))?;
-    let status = resp.status();
-    let body = resp
-        .bytes()
-        .await
-        .map_err(|e| format!("reading the response from {api_url} failed: {e}"))?;
-    if !status.is_success() {
-        return Err(format!("GitHub API returned HTTP {status} for {api_url}"));
-    }
-    serde_json::from_slice(&body)
+async fn fetch_latest_github_release(
+    api_url: &str,
+    project: &str,
+) -> Result<GitHubRelease, String> {
+    let body = crate::util::fetch_github_release_text(api_url, None).await?;
+    serde_json::from_str(&body)
         .map_err(|e| format!("could not parse the {project} release info: {e}"))
 }
 
 async fn fetch_latest_bore_release() -> Result<GitHubRelease, String> {
     fetch_latest_github_release(BORE_RELEASE_API_URL, "bore").await
-}
-
-fn http_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .user_agent(USER_AGENT)
-        .connect_timeout(CONNECT_TIMEOUT)
-        .build()
-        .map_err(|e| format!("failed to build HTTP client: {e}"))
 }
 
 /// Stream `url` into `dest`, then unpack the engine binary into place.
@@ -414,7 +390,8 @@ async fn fetch_and_unpack(
     let download_path = dir.join(format!("{final_name}.download"));
     let staged_path = dir.join(format!("{final_name}.staging"));
 
-    download_to_file(url, &download_path).await?;
+    // 大文件下载：不设整体超时，仅保留共享客户端的 30s 连接超时。
+    crate::util::download_to_file(url, &download_path, None).await?;
 
     let unpack = match archive_kind(asset_name) {
         ArchiveKind::Plain => {
@@ -459,47 +436,6 @@ async fn fetch_and_unpack(
     let _ = std::fs::remove_file(&backup_path);
 
     Ok(final_path)
-}
-
-/// Streaming download — chunks are written straight to disk, the whole body
-/// never sits in memory.
-async fn download_to_file(url: &str, dest: &Path) -> Result<(), String> {
-    use futures_util::StreamExt;
-
-    let resp = http_client()?
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| format!("download request to {url} failed: {e}"))?;
-    let status = resp.status();
-    if !status.is_success() {
-        return Err(format!("download failed: HTTP {status} from {url}"));
-    }
-
-    let mut file = std::fs::File::create(dest)
-        .map_err(|e| format!("failed to create {}: {e}", dest.display()))?;
-    let mut received: u64 = 0;
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| {
-            let _ = std::fs::remove_file(dest);
-            format!("download of {url} was interrupted after {received} bytes: {e}")
-        })?;
-        file.write_all(&chunk).map_err(|e| {
-            let _ = std::fs::remove_file(dest);
-            format!("failed to write {}: {e}", dest.display())
-        })?;
-        received += chunk.len() as u64;
-    }
-    file.flush()
-        .map_err(|e| format!("failed to flush {}: {e}", dest.display()))?;
-    drop(file);
-
-    if received == 0 {
-        let _ = std::fs::remove_file(dest);
-        return Err(format!("download of {url} produced an empty file"));
-    }
-    Ok(())
 }
 
 #[cfg(unix)]

@@ -1,7 +1,6 @@
 {
   "app": {
-    "name": "圣手码头",
-    "tagline": "内网穿透"
+    "name": "圣手码头"
   },
   "nav": {
     "tunnels": "隧道",
@@ -16,18 +15,9 @@
     "cancel": "取消",
     "delete": "删除",
     "edit": "编辑",
-    "save": "保存",
-    "confirm": "确认",
     "back": "上一步",
     "close": "关闭",
     "dash": "—"
-  },
-  "status": {
-    "stopped": "已停止",
-    "starting": "启动中",
-    "running": "运行中",
-    "reconnecting": "重连中",
-    "error": "错误"
   },
   "home": {
     "title": "隧道",
@@ -64,7 +54,6 @@
     "allowlistTooltip": "IP 白名单 · {{n}} 条规则",
     "autoStart": "自启",
     "connActive": "活跃连接",
-    "editDisabledCfNamed": "固定域名隧道不支持编辑。修改配置需删除后重新创建。",
     "deleteCfNamedHint": "云端隧道与 DNS 记录仍保留在 Cloudflare，可前往 Cloudflare Dashboard 清理（后续版本将支持一键清理）。",
     "cleanupCfNamed": "清理云端资源",
     "cleanupCfNamedTitle": "清理 Cloudflare 云端资源",
@@ -76,7 +65,6 @@
   "add": {
     "createTitle": "新建隧道",
     "editTitle": "编辑隧道",
-    "chooseType": "选择隧道类型",
     "step": "第 {{current}} 步 / 共 {{total}} 步",
     "httpTitle": "HTTP Web 服务",
     "httpDescription": "给网站或接口一个临时公网网址，适合演示、联调与 webhook。",
@@ -114,7 +102,6 @@
     "hostnameTcpHint": "固定域名仅支持 HTTP 服务；TCP 隧道将使用 bore 公网中继。",
     "submitCreate": "创建并启动",
     "submitEdit": "保存修改",
-    "creating": "创建中…",
     "createFailed": "创建隧道失败",
     "createSuccess": "隧道「{{name}}」已启动",
     "updateFailed": "保存修改失败",
@@ -182,7 +169,6 @@
       "success": "固定域名隧道「{{name}}」已启动",
       "needLocalFirst": "请先在上方填写有效的本地地址和端口，再绑定固定域名。"
     },
-    "backendMappingCfNamedEdit": "固定域名 {{hostname}} 不可更改；可修改本地服务地址、端口与访问控制，保存后自动生效。",
     "udpTitle": "UDP 端口",
     "udpDescription": "把目标机器的 UDP 端口转发到公网（需自建服务器通道）。",
     "localHostHint": "转发目标：默认本机 127.0.0.1；要转发到内网其他机器（如 192.168.1.10 的 MySQL 3306），直接填它的内网 IP。",
@@ -191,7 +177,12 @@
   },
   "logs": {
     "title": "运行日志",
-    "empty": "暂无日志。启动隧道后，进程输出会实时显示在这里。"
+    "empty": "暂无日志。启动隧道后，进程输出会实时显示在这里。",
+    "clear": "清理",
+    "clearConfirmTitle": "清理日志",
+    "clearConfirmBody": "将清空该隧道在内存中的日志缓冲，不影响隧道运行。",
+    "cleared": "日志已清理",
+    "clearFailed": "清理失败"
   },
   "qr": {
     "title": "扫码访问",
@@ -227,9 +218,7 @@
       "deleteTitle": "删除服务器记录？",
       "deleteDescription": "仅移除本地记录「{{name}}」，不会影响服务器上已部署的服务。",
       "deleteSuccess": "已删除「{{name}}」",
-      "deleteFailed": "删除失败",
-      "subdomainHost": "泛域名",
-      "testDetail": "检测结果"
+      "deleteFailed": "删除失败"
     },
     "form": {
       "title": "添加服务器",
@@ -257,10 +246,6 @@
       "subdomainHostHint": "需将 *.{{host}} 的 A 记录指向此服务器后，才能使用子域名模式",
       "submit": "添加",
       "submitting": "添加中…",
-      "hostRequired": "请输入主机地址",
-      "usernameRequired": "请输入用户名",
-      "secretRequired": "请输入密码或私钥路径",
-      "portRequired": "请输入 1 - 65535 之间的端口号",
       "success": "服务器已添加，可以直接部署了",
       "failed": "添加服务器失败",
       "proxyPortRange": "转发端口段（TCP/UDP）",
@@ -307,10 +292,6 @@
     "noServer": "不指定服务器",
     "noServerHint": "未选择服务器时，导入的隧道将使用快速通道",
     "previewTitle": "解析出 {{n}} 条隧道",
-    "colName": "名称",
-    "colType": "类型",
-    "colLocal": "本地端口",
-    "colRemote": "远端 / 子域名",
     "submit": "导入 {{n}} 条隧道",
     "importing": "导入中…",
     "parseButton": "解析",
@@ -444,6 +425,7 @@
     "themeSystem": "跟随系统",
     "themeLight": "浅色",
     "themeDark": "深色",
+    "themePink": "少女粉",
     "language": "语言",
     "languageDescription": "界面显示语言",
     "autostart": "开机自启",
@@ -472,8 +454,28 @@
     "installing": "安装中…",
     "installFailed": "引擎安装失败",
     "installSuccess": "引擎安装完成",
-    "versionUnknown": "未知版本",
-    "loadFailed": "加载引擎状态失败"
+    "loadFailed": "加载引擎状态失败",
+    "storage": {
+      "title": "存储占用",
+      "description": "日志缓冲、缓存与应用数据的本地占用情况",
+      "logs": "日志缓冲",
+      "logsHint": "内存中的隧道日志",
+      "logLinesValue": "{{lines}} 行 · {{size}}",
+      "cache": "缓存",
+      "cacheHint": "引擎二进制与隧道配置，可自动恢复",
+      "data": "应用数据",
+      "dataHint": "配置与秘密库",
+      "total": "合计",
+      "clearCache": "清理缓存",
+      "clearCacheTitle": "清理缓存？",
+      "clearCacheDescription": "将删除引擎二进制与隧道配置缓存，需要时会自动重新下载或恢复。",
+      "clearCacheConfirm": "确认清理",
+      "cacheCleared": "已释放 {{size}}",
+      "clearLogs": "清空全部日志",
+      "logsCleared": "已清除 {{lines}} 行日志",
+      "clearFailed": "清理缓存失败",
+      "clearLogsFailed": "清空日志失败"
+    }
   },
   "stats": {
     "sparklineTitle": "最近 60 秒流量（绿=下行，灰=上行）"

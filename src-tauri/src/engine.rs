@@ -41,7 +41,7 @@ use tokio::sync::{oneshot, Notify};
 
 use crate::binman;
 use crate::cloudflare;
-use crate::forwarder::{Forwarder, TunnelForwarder};
+use crate::forwarder::{Forwarder, LogSink, TunnelForwarder};
 use crate::models::{Backend, TunnelConfig, TunnelState, TunnelStatus, TunnelType};
 use crate::providers;
 use crate::servers_store;
@@ -59,6 +59,11 @@ const STOP_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const ERROR_LINE_MAX_LEN: usize = 300;
 /// Ring-buffer cap for per-tunnel log lines kept for the diagnostics engine.
 const LOG_RING_CAP: usize = 200;
+/// 每条日志事件的固定内存开销估值（字节）：TunnelLogEvent 的字段头
+/// （tunnel_id/line/ts 三个 String 头 + level 胖指针）+ 堆上的 tunnel_id
+/// （uuid 36 字节）与 ts（RFC3339 约 30 字节）+ VecDeque 槽位。精确值
+/// 无法从外部测得，`logs_bytes` 只给量级正确的估算。
+const LOG_LINE_FIXED_OVERHEAD: usize = 160;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -69,13 +74,15 @@ struct TunnelStateEvent {
     state: TunnelState,
 }
 
+/// 一条隧道日志（实时事件 `tunnel://log` 与历史回放 `get_tunnel_logs` 的
+/// 统一载荷，serde camelCase：tunnelId/level/line/ts）。
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct TunnelLogEvent {
-    pub(crate) tunnel_id: String,
-    pub(crate) level: &'static str,
-    pub(crate) line: String,
-    pub(crate) ts: String,
+pub struct TunnelLogEvent {
+    pub tunnel_id: String,
+    pub level: &'static str,
+    pub line: String,
+    pub ts: String,
 }
 
 pub struct Engine {
@@ -84,6 +91,8 @@ pub struct Engine {
 }
 
 struct TunnelHandle {
+    /// This tunnel's id; stamped into every buffered log event.
+    id: String,
     state: RwLock<TunnelState>,
     /// Set when the user asks for a stop; checked by the supervisor and every
     /// attempt so the retry loop unwinds immediately.
@@ -97,9 +106,10 @@ struct TunnelHandle {
     notify: Notify,
     /// OS pid of the current child (0 when none). Informational.
     pid: AtomicU32,
-    /// Ring buffer of the most recent output lines (ANSI stripped, oldest
-    /// first), consumed by the diagnostics engine via `Engine::recent_logs`.
-    logs: Mutex<VecDeque<String>>,
+    /// Ring buffer of the most recent structured log events (ANSI stripped,
+    /// oldest first), consumed by `Engine::recent_logs` (diagnose) and
+    /// `Engine::tunnel_logs` (frontend replay via `get_tunnel_logs`).
+    logs: Mutex<VecDeque<TunnelLogEvent>>,
     /// This tunnel's local forwarder (stats + access control). `Some` from the
     /// first start attempt on; reused across attempts and restarts while its
     /// upstream target matches. Kept after stop so the card keeps showing the
@@ -111,6 +121,7 @@ struct TunnelHandle {
 impl TunnelHandle {
     fn new(id: &str) -> Self {
         Self {
+            id: id.to_string(),
             state: RwLock::new(TunnelState::new(id)),
             stop_flag: AtomicBool::new(false),
             supervising: AtomicBool::new(false),
@@ -122,14 +133,50 @@ impl TunnelHandle {
         }
     }
 
-    /// Append one stripped output line to the ring buffer, dropping the
-    /// oldest when full.
-    fn push_log(&self, line: &str) {
+    /// 追加一条结构化日志到环形缓冲（满则丢弃最老）。ts 在 push 时固定，
+    /// 保证历史回放与实时事件同构同源。
+    fn push_log(&self, level: &'static str, line: &str) {
         let mut logs = self.logs.lock().unwrap_or_else(|e| e.into_inner());
         if logs.len() >= LOG_RING_CAP {
             logs.pop_front();
         }
-        logs.push_back(line.to_string());
+        logs.push_back(TunnelLogEvent {
+            tunnel_id: self.id.clone(),
+            level,
+            line: line.to_string(),
+            ts: chrono::Utc::now().to_rfc3339(),
+        });
+    }
+
+    /// 回放缓冲中最新的 `limit` 条（最老在前）；`None` = 全部（上限 ring cap）。
+    /// `get_tunnel_logs` 命令的取数实现。
+    fn log_replay(&self, limit: Option<u32>) -> Vec<TunnelLogEvent> {
+        let logs = self.logs.lock().unwrap_or_else(|e| e.into_inner());
+        let start = match limit {
+            Some(n) => logs.len().saturating_sub(n as usize),
+            None => 0,
+        };
+        logs.iter().skip(start).cloned().collect()
+    }
+
+    /// 清空环形缓冲，返回清掉的行数。`shrink_to_fit` 把 VecDeque 的已分配
+    /// 内存一并还给分配器（clear 只重置长度不缩容）。
+    fn clear_logs(&self) -> u64 {
+        let mut logs = self.logs.lock().unwrap_or_else(|e| e.into_inner());
+        let n = logs.len() as u64;
+        logs.clear();
+        logs.shrink_to_fit();
+        n
+    }
+
+    /// 日志缓冲的内存占用估算（字节）：逐行 `line.len()` 累加 + 每行固定
+    /// 开销估值。精确值无法从外部测得，此处只给量级正确的估算——固定开销
+    /// 覆盖 TunnelLogEvent 的三个 String 头 + level 胖指针 + 堆上的
+    /// tunnel_id（uuid 36 字节）与 ts（RFC3339 约 30 字节）+ VecDeque 槽位。
+    fn logs_bytes(&self) -> u64 {
+        let logs = self.logs.lock().unwrap_or_else(|e| e.into_inner());
+        let bytes = logs.iter().map(|e| e.line.len() as u64).sum::<u64>();
+        bytes + logs.len() as u64 * LOG_LINE_FIXED_OVERHEAD as u64
     }
 
     fn snapshot(&self) -> TunnelState {
@@ -215,7 +262,72 @@ impl Engine {
         };
         let logs = handle.logs.lock().unwrap_or_else(|e| e.into_inner());
         let skip = logs.len().saturating_sub(max);
-        logs.iter().skip(skip).cloned().collect()
+        logs.iter().skip(skip).map(|e| e.line.clone()).collect()
+    }
+
+    /// 结构化日志回放（命令 `get_tunnel_logs` 的数据源）：缓冲中最新的
+    /// `limit` 条（最老在前）；`None` = 全部缓冲（上限 ring cap）。隧道在
+    /// 本会话没有活动 handle 时返回空 Vec。
+    pub fn tunnel_logs(&self, id: &str, limit: Option<u32>) -> Vec<TunnelLogEvent> {
+        let handles = self.handles.lock().unwrap_or_else(|e| e.into_inner());
+        match handles.get(id) {
+            Some(handle) => handle.log_replay(limit),
+            None => Vec::new(),
+        }
+    }
+
+    /// 清空指定隧道的环形缓冲，返回清掉的行数。id 没有活动 handle（本会话
+    /// 从未启动过）时返回 Err——命令层先用 store 判存在性，再决定报错还是
+    /// 返回 0 行，这里保持「无 handle 即无缓冲」的严格语义。
+    pub fn clear_logs(&self, id: &str) -> Result<u64, String> {
+        let handle = self
+            .handles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .cloned()
+            .ok_or_else(|| format!("隧道不存在或本会话尚未运行过：{id}"))?;
+        Ok(handle.clear_logs())
+    }
+
+    /// 清空全部隧道的环形缓冲，返回清掉的总行数。
+    pub fn clear_all_logs(&self) -> u64 {
+        // 短锁内只克隆 Arc 列表，清空动作在锁外逐个进行。
+        let handles: Vec<Arc<TunnelHandle>> = self
+            .handles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        handles.iter().map(|h| h.clear_logs()).sum()
+    }
+
+    /// 全部隧道日志缓冲的（总行数, 字节估算）。命令 `get_storage_usage` 的
+    /// 日志侧数据源。锁粒度：handles 锁只用来克隆 Arc 列表（快进快出），
+    /// 之后逐个 handle 短锁取数，不长时间持锁阻塞日志写入/启动路径。
+    pub fn storage_usage(&self) -> (u64, u64) {
+        let handles: Vec<Arc<TunnelHandle>> = self
+            .handles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        Self::aggregate_log_usage(&handles)
+    }
+
+    /// `storage_usage` 的纯聚合逻辑（单独提出以便单测：`Engine` 需要
+    /// `AppHandle`，单测无法构造）。逐个 handle 两次短锁取数（行数、字节
+    /// 各一），handle 上的日志锁竞争极低（写路径只有单行 push）。
+    fn aggregate_log_usage(handles: &[Arc<TunnelHandle>]) -> (u64, u64) {
+        let mut lines = 0u64;
+        let mut bytes = 0u64;
+        for h in handles {
+            lines += h.logs.lock().unwrap_or_else(|e| e.into_inner()).len() as u64;
+            bytes += h.logs_bytes();
+        }
+        (lines, bytes)
     }
 
     /// Start (or resume retrying) a tunnel. Returns the state right after
@@ -478,7 +590,11 @@ async fn wait_backoff(delay: Duration, handle: &TunnelHandle) -> bool {
 
 /// One full run attempt: resolve binary -> spawn -> stream/parse output until
 /// the process exits or the user stops it.
-async fn run_attempt(engine: &Engine, handle: &TunnelHandle, cfg: &TunnelConfig) -> AttemptOutcome {
+async fn run_attempt(
+    engine: &Arc<Engine>,
+    handle: &Arc<TunnelHandle>,
+    cfg: &TunnelConfig,
+) -> AttemptOutcome {
     if handle.stop_flag.load(Ordering::SeqCst) {
         return AttemptOutcome {
             had_url: false,
@@ -681,9 +797,9 @@ async fn run_attempt(engine: &Engine, handle: &TunnelHandle, cfg: &TunnelConfig)
                 if line.is_empty() {
                     continue;
                 }
-                // Keep the ANSI-stripped form in the diagnostics ring buffer.
-                handle.push_log(&providers::strip_ansi(&line));
+                // 环形缓冲保存与实时事件同构的结构化记录（ANSI 已剥离）。
                 let level = providers::classify_level(cfg.backend, &line);
+                handle.push_log(level, &providers::strip_ansi(&line));
                 engine.emit_log(&cfg.id, level, &line);
                 if level == "error" {
                     // Transient cloudflared errors are common while it dials
@@ -881,8 +997,8 @@ fn with_forwarder_endpoint(cfg: &TunnelConfig, forwarder_port: u16) -> TunnelCon
 /// * Replaced when it was stopped (previous run) or the tunnel's target was
 ///   edited. The counters of the replacement start at zero.
 async fn ensure_forwarder(
-    engine: &Engine,
-    handle: &TunnelHandle,
+    engine: &Arc<Engine>,
+    handle: &Arc<TunnelHandle>,
     cfg: &TunnelConfig,
 ) -> Result<TunnelForwarder, String> {
     // Bind the clone to a local FIRST: the MutexGuard temporary must be gone
@@ -904,7 +1020,7 @@ async fn ensure_forwarder(
     // tunnel configured with auth but missing its keychain entry is a hard
     // configuration error — running it UNPROTECTED would be the worse failure.
     let auth_password = if cfg.auth.is_some() {
-        match servers_store::get_tunnel_auth_password(&engine.app, &cfg.id) {
+        match servers_store::get_tunnel_auth_password(&cfg.id) {
             Ok(Some(password)) => Some(password),
             Ok(None) => {
                 return Err(format!(
@@ -922,15 +1038,35 @@ async fn ensure_forwarder(
         None
     };
 
+    // 转发器连接日志的统一出口：入环形缓冲 + emit 实时事件，两条路径与
+    // 进程输出日志完全一致。级别由转发器给定（info/warn），文案为技术性
+    // 英文（不进 i18n）。每连接固定两行，热路径不经过此闭包。
+    let log_tunnel_id = cfg.id.clone();
+    let log_handle = handle.clone();
+    let log_engine = engine.clone();
+    let log_sink: LogSink = Arc::new(move |level, line| {
+        log_handle.push_log(level, &line);
+        log_engine.emit_log(&log_tunnel_id, level, &line);
+    });
+
     let (fwd, port) = match cfg.tunnel_type {
         TunnelType::Http | TunnelType::Tcp => {
-            let (fwd, port) =
-                Forwarder::start(engine.app.clone(), cfg.clone(), auth_password).await?;
+            let (fwd, port) = Forwarder::start(
+                engine.app.clone(),
+                cfg.clone(),
+                auth_password,
+                Some(log_sink),
+            )
+            .await?;
             (TunnelForwarder::Tcp(fwd), port)
         }
         TunnelType::Udp => {
-            let (fwd, port) = crate::forwarder::UdpForwarder::start(engine.app.clone(), cfg.clone())
-                .await?;
+            let (fwd, port) = crate::forwarder::UdpForwarder::start(
+                engine.app.clone(),
+                cfg.clone(),
+                Some(log_sink),
+            )
+            .await?;
             (TunnelForwarder::Udp(fwd), port)
         }
     };
@@ -943,7 +1079,7 @@ async fn ensure_forwarder(
         "{transport} forwarder: listening on 127.0.0.1:{port} -> {}:{}",
         cfg.local_host, cfg.local_port
     );
-    handle.push_log(&line);
+    handle.push_log("info", &line);
     engine.emit_log(&cfg.id, "info", &line);
     Ok(fwd)
 }
@@ -1061,5 +1197,101 @@ mod tests {
         // Only the dial target changed.
         assert_eq!(dial.local_port, 41234);
         assert_eq!(dial.local_host, "127.0.0.1");
+    }
+
+    /// 打开日志面板前的历史回放：环形缓冲必须保存结构化记录（与实时事件
+    /// tunnel://log 同构），命令 `commands::get_tunnel_logs` 经
+    /// `Engine::tunnel_logs` 读的就是这里驱动的 handle 级实现。
+    /// `State<'_, AppState>` 需要真实 Tauri 运行时，单测无法构造，故直接
+    /// 对命令背后的取数函数断言（命令本体是一行委托）。
+    #[test]
+    fn test_tunnel_log_buffer_replays_structured() {
+        let handle = TunnelHandle::new("t-log-replay");
+        handle.push_log("info", "engine: tunnel t-log-replay starting");
+        handle.push_log("error", "dial tcp 10.0.0.1:8080: connect refused");
+        handle.push_log("info", "tcp forwarder: listening on 127.0.0.1:41234");
+
+        // 默认（limit = None）：回放全部缓冲，最老在前。
+        let replay = handle.log_replay(None);
+        assert_eq!(replay.len(), 3, "应回放全部 3 条");
+        for ev in &replay {
+            assert_eq!(ev.tunnel_id, "t-log-replay");
+            assert!(!ev.ts.is_empty(), "ts 必须非空");
+        }
+        assert_eq!(replay[0].level, "info");
+        assert_eq!(replay[0].line, "engine: tunnel t-log-replay starting");
+        assert_eq!(replay[1].level, "error");
+        assert_eq!(replay[1].line, "dial tcp 10.0.0.1:8080: connect refused");
+        assert_eq!(replay[2].level, "info");
+        assert_eq!(
+            replay[2].line,
+            "tcp forwarder: listening on 127.0.0.1:41234"
+        );
+
+        // limit = 2：只取最新 2 条，仍是最老在前。
+        let tail = handle.log_replay(Some(2));
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail[0].line, "dial tcp 10.0.0.1:8080: connect refused");
+        assert_eq!(tail[1].line, "tcp forwarder: listening on 127.0.0.1:41234");
+
+        // 缓冲写满（cap 200）后继续写入：最老记录被挤出，最新一条在末尾。
+        for i in 0..=(LOG_RING_CAP as u32) {
+            handle.push_log("info", &format!("filler line {i}"));
+        }
+        let all = handle.log_replay(None);
+        assert_eq!(all.len(), LOG_RING_CAP);
+        assert_eq!(
+            all.last().unwrap().line,
+            format!("filler line {LOG_RING_CAP}"),
+            "最新一条必须在末尾"
+        );
+        assert_eq!(all[0].line, "filler line 1", "最老的记录应已被挤出");
+    }
+
+    /// 「清理日志」命令（commands::clear_tunnel_logs -> Engine::clear_logs ->
+    /// TunnelHandle::clear_logs）的 handle 级语义：返回清掉的行数、缓冲彻底
+    /// 变空（回放为空、字节估算归零），且清空后可以继续正常写入。
+    #[test]
+    fn test_clear_logs_empties_buffer_and_reports_count() {
+        let handle = TunnelHandle::new("t-clear");
+        handle.push_log("info", "first line");
+        handle.push_log("error", "second line");
+        handle.push_log("info", "third line");
+        assert!(handle.logs_bytes() > 0, "清理前字节估算应大于 0");
+
+        assert_eq!(handle.clear_logs(), 3, "应报告清掉 3 行");
+        assert!(handle.log_replay(None).is_empty(), "清理后回放应为空");
+        assert_eq!(handle.logs_bytes(), 0, "清理后字节估算应归零");
+        assert_eq!(handle.clear_logs(), 0, "重复清理应报告 0 行");
+
+        // 清空后缓冲仍可正常写入（环形容量语义不变）。
+        handle.push_log("info", "after clear");
+        let replay = handle.log_replay(None);
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].line, "after clear");
+    }
+
+    /// 「存储占用统计」日志侧的聚合（Engine::aggregate_log_usage）：
+    /// 总行数跨 handle 求和，字节估算 = 各 handle 行字节累加 + 每行固定
+    /// 开销估值（口径与 TunnelHandle::logs_bytes 完全一致）。
+    #[test]
+    fn test_aggregate_log_usage_sums_lines_and_bytes() {
+        let a = TunnelHandle::new("t-agg-a");
+        a.push_log("info", "aaaa"); // 4 字节
+        a.push_log("info", "bb"); // 2 字节
+        let b = TunnelHandle::new("t-agg-b");
+        b.push_log("info", "ccc"); // 3 字节
+
+        let handles = vec![Arc::new(a), Arc::new(b)];
+        let (lines, bytes) = Engine::aggregate_log_usage(&handles);
+        assert_eq!(lines, 3, "两个 handle 的行数应求和");
+        assert_eq!(
+            bytes,
+            (4 + 2 + 3) as u64 + 3 * LOG_LINE_FIXED_OVERHEAD as u64,
+            "字节 = 各行 line.len() 累加 + 每行固定开销估值"
+        );
+
+        // 空集合返回 (0, 0)（命令层的 StorageUsage 各字段可安全归零）。
+        assert_eq!(Engine::aggregate_log_usage(&[]), (0, 0));
     }
 }

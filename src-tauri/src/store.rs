@@ -41,26 +41,11 @@ impl Store {
         }
     }
 
-    /// Atomically replace the store file (write `<path>.tmp`, then rename).
+    /// Atomically replace the store file (temp-file + rename via util).
     pub fn save(&self, tunnels: &[TunnelConfig]) -> Result<(), String> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("failed to create data dir: {e}"))?;
-        }
         let text = serde_json::to_string_pretty(tunnels)
             .map_err(|e| format!("failed to serialize tunnels: {e}"))?;
-        let tmp = self.path.with_extension("json.tmp");
-        fs::write(&tmp, text).map_err(|e| format!("failed to write temp file: {e}"))?;
-
-        // `fs::rename` is atomic on the same filesystem but fails on Windows
-        // when the destination exists, so remove it there first.
-        #[cfg(windows)]
-        if self.path.exists() {
-            let _ = fs::remove_file(&self.path);
-        }
-        fs::rename(&tmp, &self.path).map_err(|e| {
-            let _ = fs::remove_file(&tmp);
-            format!("failed to replace {}: {e}", self.path.display())
-        })
+        crate::util::write_json_atomic(&self.path, &text)
     }
 
     pub fn get(&self, id: &str) -> Result<Option<TunnelConfig>, String> {

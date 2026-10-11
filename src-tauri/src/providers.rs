@@ -51,6 +51,8 @@ use std::path::{Path, PathBuf};
 use tauri::Manager;
 
 use crate::models::{Backend, ServerConfig, TunnelConfig, TunnelType};
+// TOML basic-string 转义与 frp_deploy.rs 共用（crate::util）。
+use crate::util::toml_escape;
 
 /// Public relay server used by the bore backend in M1 (config has no field
 /// for it yet).
@@ -157,7 +159,7 @@ pub async fn prepare_frpc_config(
         .ok_or_else(|| {
             format!("隧道绑定的服务器不存在 (bound server {server_id:?} was not found)")
         })?;
-    let token = crate::servers_store::get_frps_token(app, server_id)
+    let token = crate::servers_store::get_frps_token(server_id)
         .map_err(|e| format!("无法读取 frps token (failed to read the frps token): {e}"))?;
 
     let (text, public_url) = build_frpc_toml(cfg, &server, &token)?;
@@ -292,23 +294,6 @@ pub fn build_frpc_toml(
     }
 
     Ok((s, public_url))
-}
-
-/// Escape a string for inclusion as a TOML basic string (double-quoted).
-fn toml_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04X}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out
 }
 
 /// Tunnel ids are uuids today, but keep cache file names safe regardless.

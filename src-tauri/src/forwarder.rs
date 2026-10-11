@@ -39,6 +39,11 @@ use crate::models::{TunnelAuth, TunnelConfig, TunnelStats, TunnelType};
 /// (only when something changed) plus one final event on stop.
 pub const TUNNEL_STATS_EVENT: &str = "tunnel://stats";
 
+/// 转发器连接日志的出口：由 engine 注入（写环形缓冲 + emit `tunnel://log`
+/// 实时事件），`None`（单测）时连接日志为 no-op。级别限定 info/warn。
+/// 每连接固定两行 + 少量分配；逐字节复制的热路径不经过它。
+pub type LogSink = std::sync::Arc<dyn Fn(&'static str, String) + Send + Sync>;
+
 /// Upper bound for the intercepted HTTP request head (headers only).
 const HEADER_BLOCK_CAP: usize = 8 * 1024;
 /// A client that sends neither a complete head nor EOF within this window is
@@ -84,6 +89,9 @@ pub struct Forwarder {
     next_conn_id: AtomicU64,
     last_unreachable_log_ms: AtomicU64,
     final_stats_emitted: AtomicBool,
+    /// 连接日志出口（engine 注入；单测为 None）。`next_conn_id` 同时充任
+    /// 日志里的连接序号。
+    log_sink: Option<LogSink>,
 }
 
 impl Forwarder {
@@ -93,8 +101,9 @@ impl Forwarder {
         app: AppHandle,
         cfg: TunnelConfig,
         auth_password: Option<String>,
+        log_sink: Option<LogSink>,
     ) -> Result<(Arc<Forwarder>, u16), String> {
-        Self::spawn(Some(app), cfg, auth_password).await
+        Self::spawn(Some(app), cfg, auth_password, log_sink).await
     }
 
     /// Real constructor; `app` is optional so unit tests can run the full
@@ -103,6 +112,7 @@ impl Forwarder {
         app: Option<AppHandle>,
         cfg: TunnelConfig,
         auth_password: Option<String>,
+        log_sink: Option<LogSink>,
     ) -> Result<(Arc<Forwarder>, u16), String> {
         let listener = TcpListener::bind("127.0.0.1:0").await.map_err(|e| {
             format!("forwarder: 绑定本地监听端口失败 (failed to bind local listener): {e}")
@@ -143,6 +153,7 @@ impl Forwarder {
             next_conn_id: AtomicU64::new(0),
             last_unreachable_log_ms: AtomicU64::new(0),
             final_stats_emitted: AtomicBool::new(false),
+            log_sink,
         });
 
         let accept = tokio::spawn(accept_loop(listener, fwd.clone(), stop_rx.clone()));
@@ -226,6 +237,14 @@ impl Forwarder {
         )
     }
 
+    /// 连接级日志走 sink（engine 注入：入环形缓冲 + emit 实时事件）；
+    /// `None`（单测）时为 no-op。仅每连接两行，热路径不调用。
+    fn log_conn(&self, level: &'static str, line: String) {
+        if let Some(sink) = &self.log_sink {
+            sink(level, line);
+        }
+    }
+
     fn emit_stats(&self) {
         let Some(app) = &self.app else { return };
         let (bytes_in, bytes_out, conn_active) = self.counters();
@@ -299,16 +318,27 @@ pub struct UdpForwarder {
     replies: Mutex<HashMap<u64, JoinHandle<()>>>,
     next_reply_id: AtomicU64,
     final_stats_emitted: AtomicBool,
+    /// 连接（会话）日志出口（engine 注入；单测为 None）。`next_reply_id`
+    /// 同时充任日志里的会话序号。
+    log_sink: Option<LogSink>,
 }
 
 impl UdpForwarder {
     /// Start a UDP forwarder for `cfg`; returns the local port the tunnel
     /// binary must send to.
-    pub async fn start(app: AppHandle, cfg: TunnelConfig) -> Result<(Arc<Self>, u16), String> {
-        Self::spawn(Some(app), cfg).await
+    pub async fn start(
+        app: AppHandle,
+        cfg: TunnelConfig,
+        log_sink: Option<LogSink>,
+    ) -> Result<(Arc<Self>, u16), String> {
+        Self::spawn(Some(app), cfg, log_sink).await
     }
 
-    async fn spawn(app: Option<AppHandle>, cfg: TunnelConfig) -> Result<(Arc<Self>, u16), String> {
+    async fn spawn(
+        app: Option<AppHandle>,
+        cfg: TunnelConfig,
+        log_sink: Option<LogSink>,
+    ) -> Result<(Arc<Self>, u16), String> {
         let listener = tokio::net::UdpSocket::bind("127.0.0.1:0")
             .await
             .map_err(|e| format!("udp forwarder: 绑定本地监听端口失败 (failed to bind): {e}"))?;
@@ -334,11 +364,19 @@ impl UdpForwarder {
             replies: Mutex::new(HashMap::new()),
             next_reply_id: AtomicU64::new(0),
             final_stats_emitted: AtomicBool::new(false),
+            log_sink,
         });
 
         let task = tokio::spawn(udp_forward_loop(listener, fwd.clone(), stop_rx));
         *fwd.task.lock().unwrap_or_else(|e| e.into_inner()) = Some(task);
         Ok((fwd, port))
+    }
+
+    /// 会话级日志走 sink（与 TCP 侧 log_conn 同一约定：None 时 no-op）。
+    fn log_conn(&self, level: &'static str, line: String) {
+        if let Some(sink) = &self.log_sink {
+            sink(level, line);
+        }
     }
 
     pub async fn stop(&self) {
@@ -427,13 +465,18 @@ async fn udp_reply_loop(
     }
 }
 
+/// 一个 UDP 会话：上游 socket + 会话序号（open/close 日志里的 conn #n）。
+type UdpSession = (Arc<tokio::net::UdpSocket>, u64);
+
 /// Main UDP loop: accept datagrams, route them into per-client sessions.
 async fn udp_forward_loop(
     listener: Arc<tokio::net::UdpSocket>,
     fwd: Arc<UdpForwarder>,
     mut stop_rx: watch::Receiver<bool>,
 ) {
-    let sessions: Arc<Mutex<HashMap<SocketAddr, Arc<tokio::net::UdpSocket>>>> =
+    // 值携带会话序号：open 行在创建时打，close 行在释放时打（reply 任务
+    // 自清理或本循环停止收尾，同把 map 锁内先移除者获胜，恰好一行）。
+    let sessions: Arc<Mutex<HashMap<SocketAddr, UdpSession>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let mut buf = vec![0u8; UDP_DATAGRAM_CAP];
     loop {
@@ -464,7 +507,7 @@ async fn udp_forward_loop(
                 .get(&peer)
                 .cloned();
             match existing {
-                Some(sock) => sock,
+                Some((sock, _)) => sock,
                 None => {
                     let Ok(sock) = tokio::net::UdpSocket::bind("0.0.0.0:0").await else {
                         continue;
@@ -477,14 +520,23 @@ async fn udp_forward_loop(
                         continue; // unreachable target: drop the datagram
                     }
                     let sock = Arc::new(sock);
+                    let id = fwd.next_reply_id.fetch_add(1, Ordering::Relaxed);
                     let inserted = {
                         let mut map = sessions.lock().unwrap_or_else(|e| e.into_inner());
                         let is_new = !map.contains_key(&peer);
-                        map.insert(peer, sock.clone());
+                        map.insert(peer, (sock.clone(), id));
                         is_new
                     };
                     if inserted {
                         fwd.sessions.fetch_add(1, Ordering::SeqCst);
+                        // open 行：对端地址 + 上游目标，与 TCP accept 行同风格。
+                        fwd.log_conn(
+                            "info",
+                            format!(
+                                "conn #{id} udp from {peer} -> {}:{}",
+                                fwd.upstream_host, fwd.upstream_port
+                            ),
+                        );
                     }
                     // The reply task owns clones of everything it touches and
                     // removes its own session on exit (unless a newer session
@@ -494,7 +546,6 @@ async fn udp_forward_loop(
                     let reply_sock = sock.clone();
                     let reply_peer = peer;
                     let reply_sessions = sessions.clone();
-                    let id = fwd.next_reply_id.fetch_add(1, Ordering::Relaxed);
                     let task = tokio::spawn(async move {
                         udp_reply_loop(
                             reply_fwd.clone(),
@@ -504,10 +555,15 @@ async fn udp_forward_loop(
                         )
                         .await;
                         let mut map = reply_sessions.lock().unwrap_or_else(|e| e.into_inner());
-                        if map.get(&reply_peer).map(|s| Arc::ptr_eq(s, &reply_sock)) == Some(true)
+                        if map
+                            .get(&reply_peer)
+                            .map(|(s, _)| Arc::ptr_eq(s, &reply_sock))
+                            == Some(true)
                         {
                             map.remove(&reply_peer);
                             reply_fwd.sessions.fetch_sub(1, Ordering::SeqCst);
+                            // close 行：60s 空闲回收（或上游 socket 报错）时释放。
+                            reply_fwd.log_conn("info", format!("conn #{id} udp closed"));
                         }
                     });
                     // The task may already have finished (and removed itself)
@@ -523,6 +579,15 @@ async fn udp_forward_loop(
         if upstream.send(&buf[..n]).await.is_ok() {
             fwd.bytes_in.fetch_add(n as u64, Ordering::SeqCst);
         }
+    }
+    // 收到 stop 退出：为仍存活的会话补记 close 行。与 reply 任务的自清理
+    // 互斥（同把 map 锁内先移除者获胜），每条 close 恰好出现一次。
+    let live: Vec<u64> = {
+        let mut map = sessions.lock().unwrap_or_else(|e| e.into_inner());
+        map.drain().map(|(_, (_, id))| id).collect()
+    };
+    for id in live {
+        fwd.log_conn("info", format!("conn #{id} udp closed"));
     }
 }
 
@@ -615,11 +680,20 @@ async fn accept_loop(
         };
 
         let id = fwd.next_conn_id.fetch_add(1, Ordering::Relaxed);
+        // accept 行：连接进入即留痕（含来源对端与上游目标）。每连接两行
+        // 中的第一行；`next_conn_id` 同时充任本实例内的连接序号。
+        fwd.log_conn(
+            "info",
+            format!(
+                "conn #{id} tcp from {peer} -> {}:{}",
+                fwd.upstream_host, fwd.upstream_port
+            ),
+        );
         let conn_fwd = fwd.clone();
         let task = tokio::spawn(async move {
             conn_fwd.conn_active.fetch_add(1, Ordering::SeqCst);
             let _guard = ConnGuard(conn_fwd.conn_active.clone());
-            handle_conn(&conn_fwd, stream, peer.ip()).await;
+            handle_conn(&conn_fwd, stream, peer.ip(), id).await;
             conn_fwd
                 .conns
                 .lock()
@@ -637,7 +711,7 @@ async fn accept_loop(
 
 /// One proxied connection: allowlist -> optional basic-auth interception ->
 /// upstream connect -> counted bidirectional copy.
-async fn handle_conn(fwd: &Forwarder, mut stream: TcpStream, peer: IpAddr) {
+async fn handle_conn(fwd: &Forwarder, mut stream: TcpStream, peer: IpAddr, conn_id: u64) {
     if !ip_allowed(peer, &fwd.allowlist) {
         // Denied by the allowlist: close without exchanging a single byte.
         return;
@@ -692,7 +766,19 @@ async fn handle_conn(fwd: &Forwarder, mut stream: TcpStream, peer: IpAddr) {
         bytes_in: fwd.bytes_in.clone(),
         bytes_out: fwd.bytes_out.clone(),
     };
-    let _ = tokio::io::copy_bidirectional(&mut counted, &mut upstream).await;
+    // 完成行带 copy_bidirectional 的真实字节数（sent = 客户端 -> 本地服务，
+    // received = 本地服务 -> 客户端）；出错则记单行 warn（Err 不携带字节数）。
+    match tokio::io::copy_bidirectional(&mut counted, &mut upstream).await {
+        Ok((sent, received)) => {
+            fwd.log_conn(
+                "info",
+                format!("conn #{conn_id} tcp closed, sent {sent} B, received {received} B"),
+            );
+        }
+        Err(e) => {
+            fwd.log_conn("warn", format!("conn #{conn_id} tcp copy error: {e}"));
+        }
+    }
 }
 
 /// Read the request head (up to and including the blank line) with an 8KB cap
@@ -1170,10 +1256,73 @@ mod tests {
 
     // --- end-to-end forwarder behaviour ---------------------------------------
 
+    /// 每个转发连接必须产生日志：accept 行（含来源对端与上游目标）+ 完成行
+    /// （带 copy_bidirectional 的真实字节数），经 spawn 注入的 log_sink 送出。
+    #[tokio::test]
+    async fn test_forwarder_logs_connections() {
+        // 上游 echo：std::net::TcpListener 起在随机端口，阻塞线程逐连接回显。
+        let upstream = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_port = upstream.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for conn in upstream.incoming().flatten() {
+                let mut reader = match conn.try_clone() {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                let mut writer = conn;
+                let _ = std::io::copy(&mut reader, &mut writer);
+            }
+        });
+
+        let captured: Arc<Mutex<Vec<(&'static str, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_captured = captured.clone();
+        let sink: Option<LogSink> = Some(Arc::new(move |level, line| {
+            sink_captured.lock().unwrap().push((level, line));
+        }));
+
+        let (fwd, port) = Forwarder::spawn(None, cfg(TunnelType::Tcp, upstream_port), None, sink)
+            .await
+            .unwrap();
+
+        let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        client.write_all(b"hello pier").await.unwrap();
+        let mut buf = [0u8; 10];
+        client.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello pier");
+        drop(client);
+
+        // 等连接收尾：accept 行 + 完成行都落进 sink（最多 ~2s）。
+        for _ in 0..100 {
+            if captured.lock().unwrap().len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let lines = captured.lock().unwrap().clone();
+        assert!(
+            lines.len() >= 2,
+            "至少应有 accept 行与完成行，实际 {lines:?}"
+        );
+        let (accept_level, accept_line) = &lines[0];
+        assert_eq!(*accept_level, "info");
+        assert!(
+            accept_line.starts_with("conn #0 tcp from 127.0.0.1:")
+                && accept_line.contains(&format!("-> 127.0.0.1:{upstream_port}")),
+            "accept 行应含来源对端与上游目标：{accept_line}"
+        );
+        let (closed_level, closed_line) = &lines[1];
+        assert_eq!(*closed_level, "info");
+        assert!(
+            closed_line.contains("sent 10 B") && closed_line.contains("received 10 B"),
+            "完成行应带 copy_bidirectional 的真实字节数：{closed_line}"
+        );
+        fwd.stop().await;
+    }
+
     #[tokio::test]
     async fn forwarder_proxies_and_counts_without_auth() {
         let (service_port, _echo) = echo_server().await;
-        let (fwd, port) = Forwarder::spawn(None, cfg(TunnelType::Http, service_port), None)
+        let (fwd, port) = Forwarder::spawn(None, cfg(TunnelType::Http, service_port), None, None)
             .await
             .unwrap();
         assert!(fwd.upstream_matches("127.0.0.1", service_port));
@@ -1213,6 +1362,7 @@ mod tests {
             None,
             auth_cfg(TunnelType::Http, service_port, "alice"),
             Some("s3cret".into()),
+            None,
         )
         .await
         .unwrap();
@@ -1269,7 +1419,7 @@ mod tests {
         // Tunnel clients always dial from loopback, so an allowlist WITHOUT
         // loopback exercises the deny path deterministically.
         c.ip_allowlist = vec!["10.0.0.0/8".into()];
-        let (fwd, port) = Forwarder::spawn(None, c, None).await.unwrap();
+        let (fwd, port) = Forwarder::spawn(None, c, None, None).await.unwrap();
 
         let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
         let _ = client.write_all(b"nope").await; // may hit the closed socket
@@ -1296,7 +1446,7 @@ mod tests {
                 drop(sock);
             }
         });
-        let (fwd, port) = Forwarder::spawn(None, cfg(TunnelType::Tcp, service_port), None)
+        let (fwd, port) = Forwarder::spawn(None, cfg(TunnelType::Tcp, service_port), None, None)
             .await
             .unwrap();
 
@@ -1327,6 +1477,7 @@ mod tests {
             None,
             auth_cfg(TunnelType::Tcp, service_port, "alice"),
             Some("pw".into()),
+            None,
         )
         .await
         .unwrap();
@@ -1348,7 +1499,7 @@ mod tests {
         // Give the OS a beat to actually release the socket.
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let (fwd, port) = Forwarder::spawn(None, cfg(TunnelType::Http, dead_port), None)
+        let (fwd, port) = Forwarder::spawn(None, cfg(TunnelType::Http, dead_port), None, None)
             .await
             .unwrap();
         let mut client = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
@@ -1389,7 +1540,7 @@ mod tests {
     #[tokio::test]
     async fn udp_forwarder_relays_and_counts() {
         let (service_port, _echo) = udp_echo_server().await;
-        let (fwd, port) = UdpForwarder::spawn(None, udp_cfg("127.0.0.1", service_port))
+        let (fwd, port) = UdpForwarder::spawn(None, udp_cfg("127.0.0.1", service_port), None)
             .await
             .unwrap();
         assert!(fwd.upstream_matches("127.0.0.1", service_port));
@@ -1421,7 +1572,7 @@ mod tests {
         // Tunnel clients always originate from loopback; a list without it
         // exercises the deny path deterministically.
         c.ip_allowlist = vec!["10.0.0.0/8".into()];
-        let (fwd, port) = UdpForwarder::spawn(None, c).await.unwrap();
+        let (fwd, port) = UdpForwarder::spawn(None, c, None).await.unwrap();
 
         let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         client
@@ -1521,7 +1672,7 @@ mod tests {
         let (upstream_port, server) = http_marker_server(mark.clone()).await;
 
         let cfg = cfg(TunnelType::Http, upstream_port);
-        let (fwd, fwd_port) = Forwarder::spawn(None, cfg, None).await.unwrap();
+        let (fwd, fwd_port) = Forwarder::spawn(None, cfg, None, None).await.unwrap();
 
         let cf_bin = ensure_cloudflared().await;
         let mut child = tokio::process::Command::new(&cf_bin)

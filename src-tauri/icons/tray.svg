@@ -1,9 +1,0 @@
-<svg width="44" height="44" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
-  <!-- Pier 菜单栏模板图标：拱桥剪影，纯黑 + 透明（macOS template image，配合 iconAsTemplate=true） -->
-  <g fill="none" stroke="#000000" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M3.5 19.5v-7a8.5 8.5 0 0 1 17 0v7"/>
-    <path d="M8.5 19.5v-5.2a3.5 3.5 0 0 1 7 0v5.2"/>
-    <path d="M12 4.2v2.3"/>
-    <path d="M2.5 19.5h19"/>
-  </g>
-</svg>

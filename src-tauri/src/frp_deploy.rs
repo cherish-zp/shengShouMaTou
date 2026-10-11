@@ -9,16 +9,15 @@
 //   idempotent upgrade path, foreign-install detection) -> firewall (ufw /
 //   firewalld; SELinux via semanage, never setenforce 0) -> verify (local
 //   dashboard curl + systemctl is-active).
-use std::path::Path;
 use std::time::Duration;
 
-use futures_util::StreamExt;
 use tauri::{AppHandle, Emitter};
-use tokio::io::AsyncWriteExt;
 
 use crate::models::{DeployProgress, DeployResult, ServerConfig, StepStatus};
 use crate::servers_store;
 use crate::ssh::SshSession;
+// TOML basic-string 转义与 providers.rs 共用（crate::util）。
+use crate::util::toml_escape;
 
 const PROGRESS_EVENT: &str = "deploy://progress";
 const DONE_EVENT: &str = "deploy://done";
@@ -208,7 +207,7 @@ async fn deploy_steps(
         StepStatus::Running,
         Some("正在生成配置…".to_string()),
     );
-    let token = match step_config(app, &mut ssh, server, &download).await {
+    let token = match step_config(&mut ssh, server, &download).await {
         Ok(t) => {
             progress(
                 app,
@@ -477,7 +476,8 @@ async fn step_download(
     if source.is_none() {
         // Last resort: download on this machine and push over SFTP.
         let local = std::env::temp_dir().join(format!("pier-frp-{}-{asset}", uuid::Uuid::new_v4()));
-        download_to_file(&github_url, &local).await?;
+        // 慢速上行也要能扛住：整体超时 600s（仅本机中转下载路径）。
+        crate::util::download_to_file(&github_url, &local, Some(LOCAL_DOWNLOAD_TIMEOUT)).await?;
         ssh.upload_file(&local, TMP_TARBALL)
             .await
             .map_err(|e| format!("SFTP 上传安装包失败：{e}"))?;
@@ -534,7 +534,6 @@ async fn step_download(
 /// this in the systemd step, but failing here avoids touching /opt/pier at
 /// all before we know the install is Pier's to manage).
 async fn step_config(
-    app: &AppHandle,
     ssh: &mut SshSession,
     server: &ServerConfig,
     download: &DownloadInfo,
@@ -613,7 +612,7 @@ async fn step_config(
         }
     }
 
-    servers_store::set_frps_token(app, &server.id, &token)?;
+    servers_store::set_frps_token(&server.id, &token)?;
     Ok(token)
 }
 
@@ -989,25 +988,7 @@ pub(crate) fn generate_dashboard_password() -> String {
     uuid::Uuid::new_v4().simple().to_string()
 }
 
-/// Escape a TOML basic-string value (quotes, backslashes, control chars).
-fn toml_escape(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for c in value.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                out.push_str(&format!("\\u{:04X}", c as u32));
-            }
-            c => out.push(c),
-        }
-    }
-    out
-}
-
+/// TOML basic-string 转义与 providers.rs 共用（crate::util）。
 fn toml_str(value: &str) -> String {
     format!("\"{}\"", toml_escape(value))
 }
@@ -1160,62 +1141,14 @@ async fn detect_cloud(ssh: &mut SshSession) -> Option<&'static str> {
     None
 }
 
-fn http_client(timeout: Duration) -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .user_agent(USER_AGENT)
-        .timeout(timeout)
-        .build()
-        .map_err(|e| format!("创建 HTTP 客户端失败：{e}"))
-}
-
 /// Query the GitHub release JSON from this machine (used when the VPS cannot
 /// reach GitHub itself). None when local access also fails. Body is read as
 /// text and parsed here — the crate's reqwest build has no `json` feature.
 async fn fetch_release_json() -> Option<String> {
-    let client = http_client(Duration::from_secs(30)).ok()?;
-    let resp = client
-        .get(RELEASE_API)
-        .header("Accept", "application/vnd.github+json")
-        .send()
+    let text = crate::util::fetch_github_release_text(RELEASE_API, Some(Duration::from_secs(30)))
         .await
         .ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let text = resp.text().await.ok()?;
     (!text.is_empty()).then_some(text)
-}
-
-/// Stream a download to `dest` on this machine.
-async fn download_to_file(url: &str, dest: &Path) -> Result<(), String> {
-    let client = http_client(LOCAL_DOWNLOAD_TIMEOUT)?;
-    let resp = client
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| format!("下载请求 {url} 失败：{e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("下载 {url} 失败：HTTP {}", resp.status()));
-    }
-    let mut file = tokio::fs::File::create(dest)
-        .await
-        .map_err(|e| format!("创建本地文件 {} 失败：{e}", dest.display()))?;
-    let mut stream = resp.bytes_stream();
-    let mut received: u64 = 0;
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("下载 {url} 中断（已接收 {received} 字节）：{e}"))?;
-        file.write_all(&chunk)
-            .await
-            .map_err(|e| format!("写入本地文件 {} 失败：{e}", dest.display()))?;
-        received += chunk.len() as u64;
-    }
-    file.flush()
-        .await
-        .map_err(|e| format!("写入本地文件 {} 失败：{e}", dest.display()))?;
-    if received == 0 {
-        return Err(format!("下载 {url} 得到空文件"));
-    }
-    Ok(())
 }
 
 /// Load-modify-save a server record in servers.json.

@@ -24,10 +24,12 @@ tauri = { version = "2", features = ["image-png", "tray-icon"] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1.53.2", features = ["full"] }
-uuid = { version = "1.27.0", features = ["v4", "serde"] }
+# tokio 运行时本体由 tauri 的 async_runtime 提供；这里只声明应用代码实际
+# 用到的 API 面（engine/forwarder/tray/providers/ssh/util）：spawn、
+# select!、#[tokio::test]、进程、TCP/UDP、定时器、异步文件 IO 与同步原语。
+tokio = { version = "1.53.2", features = ["rt", "macros", "io-util", "net", "time", "fs", "process", "sync"] }
+uuid = { version = "1.27.0", features = ["v4"] }
 dirs = "7.0.0"
-thiserror = "2.0.21"
 chrono = { version = "0.4.45", features = ["serde"] }
 tauri-plugin-autostart = "2.7.0"
 tauri-plugin-single-instance = "2.5.2"

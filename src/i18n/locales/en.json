@@ -1,7 +1,6 @@
 {
   "app": {
-    "name": "Pier",
-    "tagline": "Tunnel to your localhost"
+    "name": "Pier"
   },
   "nav": {
     "tunnels": "Tunnels",
@@ -16,18 +15,9 @@
     "cancel": "Cancel",
     "delete": "Delete",
     "edit": "Edit",
-    "save": "Save",
-    "confirm": "Confirm",
     "back": "Back",
     "close": "Close",
     "dash": "—"
-  },
-  "status": {
-    "stopped": "Stopped",
-    "starting": "Starting",
-    "running": "Running",
-    "reconnecting": "Reconnecting",
-    "error": "Error"
   },
   "home": {
     "title": "Tunnels",
@@ -64,7 +54,6 @@
     "allowlistTooltip": "IP allowlist · {{n}} rules",
     "autoStart": "Auto-start",
     "connActive": "active connections",
-    "editDisabledCfNamed": "Fixed-hostname tunnels cannot be edited. Delete and recreate to change the setup.",
     "deleteCfNamedHint": "The remote tunnel and DNS record remain in your Cloudflare account — clean up in the Cloudflare dashboard (one-click cleanup is coming in a later version).",
     "cleanupCfNamed": "Clean up cloud resources",
     "cleanupCfNamedTitle": "Clean up Cloudflare resources",
@@ -76,7 +65,6 @@
   "add": {
     "createTitle": "New Tunnel",
     "editTitle": "Edit Tunnel",
-    "chooseType": "Choose a tunnel type",
     "step": "Step {{current}} of {{total}}",
     "httpTitle": "HTTP Web Service",
     "httpDescription": "Give a website or API a temporary public URL. Great for demos and webhooks.",
@@ -114,7 +102,6 @@
     "hostnameTcpHint": "Fixed hostnames are available for HTTP services only; TCP tunnels use the bore public relay.",
     "submitCreate": "Create & Start",
     "submitEdit": "Save Changes",
-    "creating": "Creating…",
     "createFailed": "Failed to create tunnel",
     "createSuccess": "Tunnel “{{name}}” started",
     "updateFailed": "Failed to save changes",
@@ -182,7 +169,6 @@
       "success": "Fixed-hostname tunnel “{{name}}” started",
       "needLocalFirst": "Fill in a valid local host and port above before linking a fixed hostname."
     },
-    "backendMappingCfNamedEdit": "Fixed hostname {{hostname}} cannot be changed. You can edit the local service address, port and access control — changes apply on the next start.",
     "udpTitle": "UDP port",
     "udpDescription": "Expose a target machine's UDP port to the public internet (self-hosted channel).",
     "localHostHint": "Forwarding target: 127.0.0.1 (this machine) by default. To reach another intranet machine (e.g. MySQL at 192.168.1.10), enter its IP directly.",
@@ -191,7 +177,12 @@
   },
   "logs": {
     "title": "Logs",
-    "empty": "No logs yet. Start the tunnel and its output will stream in here."
+    "empty": "No logs yet. Start the tunnel and its output will stream in here.",
+    "clear": "Clear",
+    "clearConfirmTitle": "Clear logs",
+    "clearConfirmBody": "This clears the in-memory log buffer for this tunnel. The tunnel keeps running.",
+    "cleared": "Logs cleared",
+    "clearFailed": "Failed to clear"
   },
   "qr": {
     "title": "Scan to Open",
@@ -227,9 +218,7 @@
       "deleteTitle": "Delete this server record?",
       "deleteDescription": "Only the local record “{{name}}” will be removed. Nothing already deployed on the server is affected.",
       "deleteSuccess": "Deleted “{{name}}”",
-      "deleteFailed": "Failed to delete",
-      "subdomainHost": "Wildcard domain",
-      "testDetail": "Result"
+      "deleteFailed": "Failed to delete"
     },
     "form": {
       "title": "Add Server",
@@ -257,10 +246,6 @@
       "subdomainHostHint": "Point an A record for *.{{host}} to this server before using subdomain mode",
       "submit": "Add",
       "submitting": "Adding…",
-      "hostRequired": "Enter a host address",
-      "usernameRequired": "Enter a username",
-      "secretRequired": "Enter a password or a key path",
-      "portRequired": "Enter a port between 1 and 65535",
       "success": "Server added. You can deploy it now.",
       "failed": "Failed to add server",
       "proxyPortRange": "Forwarding port range (TCP/UDP)",
@@ -307,10 +292,6 @@
     "noServer": "No server",
     "noServerHint": "Without a server, imported tunnels use the quick channel",
     "previewTitle": "Found {{n}} tunnels",
-    "colName": "Name",
-    "colType": "Type",
-    "colLocal": "Local port",
-    "colRemote": "Remote / subdomain",
     "submit": "Import {{n}} tunnels",
     "importing": "Importing…",
     "parseButton": "Parse",
@@ -444,6 +425,7 @@
     "themeSystem": "System",
     "themeLight": "Light",
     "themeDark": "Dark",
+    "themePink": "Girly Pink",
     "language": "Language",
     "languageDescription": "Language used across the interface",
     "autostart": "Launch at Login",
@@ -472,8 +454,28 @@
     "installing": "Installing…",
     "installFailed": "Engine installation failed",
     "installSuccess": "Engine installed",
-    "versionUnknown": "unknown version",
-    "loadFailed": "Failed to load engine status"
+    "loadFailed": "Failed to load engine status",
+    "storage": {
+      "title": "Storage Usage",
+      "description": "Local usage of the log buffer, cache and app data",
+      "logs": "Log buffer",
+      "logsHint": "In-memory tunnel logs",
+      "logLinesValue": "{{lines}} lines · {{size}}",
+      "cache": "Cache",
+      "cacheHint": "Engine binaries & tunnel configs, auto-restorable",
+      "data": "App data",
+      "dataHint": "Configs & secret store",
+      "total": "Total",
+      "clearCache": "Clear cache",
+      "clearCacheTitle": "Clear cache?",
+      "clearCacheDescription": "Downloaded engine binaries and tunnel config cache will be deleted; they are re-downloaded or restored automatically when needed.",
+      "clearCacheConfirm": "Clear now",
+      "cacheCleared": "Released {{size}}",
+      "clearLogs": "Clear all logs",
+      "logsCleared": "Cleared {{lines}} log lines",
+      "clearFailed": "Failed to clear cache",
+      "clearLogsFailed": "Failed to clear logs"
+    }
   },
   "stats": {
     "sparklineTitle": "Traffic, last 60 seconds (green = in, gray = out)"

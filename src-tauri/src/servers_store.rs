@@ -74,20 +74,7 @@ pub fn save_server(app: &tauri::AppHandle, server: &ServerConfig) -> Result<(), 
     }
     let text = serde_json::to_string_pretty(&all)
         .map_err(|e| format!("failed to serialize servers: {e}"))?;
-
-    // Atomic replace: write `<path>.tmp`, then rename. `fs::rename` is atomic
-    // on the same filesystem but fails on Windows when the destination
-    // exists, so remove it there first.
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, text).map_err(|e| format!("failed to write temp file: {e}"))?;
-    #[cfg(windows)]
-    if path.exists() {
-        let _ = fs::remove_file(&path);
-    }
-    fs::rename(&tmp, &path).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        format!("failed to replace {}: {e}", path.display())
-    })
+    crate::util::write_json_atomic(&path, &text)
 }
 
 /// Remove a server entry and its keychain secrets. Returns true if removed.
@@ -99,21 +86,9 @@ pub fn remove_server(app: &tauri::AppHandle, id: &str) -> Result<bool, String> {
     let removed = all.len() != before;
 
     if removed {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("failed to create data dir: {e}"))?;
-        }
         let text = serde_json::to_string_pretty(&all)
             .map_err(|e| format!("failed to serialize servers: {e}"))?;
-        let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, text).map_err(|e| format!("failed to write temp file: {e}"))?;
-        #[cfg(windows)]
-        if path.exists() {
-            let _ = fs::remove_file(&path);
-        }
-        fs::rename(&tmp, &path).map_err(|e| {
-            let _ = fs::remove_file(&tmp);
-            format!("failed to replace {}: {e}", path.display())
-        })?;
+        crate::util::write_json_atomic(&path, &text)?;
     }
 
     // Best-effort keychain cleanup: a leftover secret would be orphaned but
@@ -156,17 +131,6 @@ pub fn frps_token_account(server_id: &str) -> String {
     format!("{FRPS_TOKEN_PREFIX}{server_id}")
 }
 
-/// Fetch the SSH secret (password, or key file path) for a server.
-/// Part of the frozen module contract; the deploy path currently reads the
-/// secret via `fetch_ssh_secret`, so this stays reserved for future callers.
-#[allow(dead_code)]
-pub fn get_ssh_secret(app: &tauri::AppHandle, server_id: &str) -> Result<String, String> {
-    if load_servers(app).iter().all(|s| s.id != server_id) {
-        return Err(format!("server not found: {server_id}"));
-    }
-    get_keyring_secret(&ssh_secret_account(server_id))
-}
-
 /// Fetch the SSH secret straight from the keychain by server id. Exists for
 /// the SSH layer, which authenticates from a `ServerConfig` alone and has no
 /// `AppHandle` — the keyring is a global OS service so none is needed.
@@ -175,20 +139,17 @@ pub fn fetch_ssh_secret(server_id: &str) -> Result<String, String> {
 }
 
 /// Store the SSH secret for a server.
-pub fn set_ssh_secret(app: &tauri::AppHandle, server_id: &str, secret: &str) -> Result<(), String> {
-    let _ = app;
+pub fn set_ssh_secret(server_id: &str, secret: &str) -> Result<(), String> {
     set_keyring_secret(&ssh_secret_account(server_id), secret)
 }
 
 /// Store the frps auth token generated during deployment.
-pub fn set_frps_token(app: &tauri::AppHandle, server_id: &str, token: &str) -> Result<(), String> {
-    let _ = app;
+pub fn set_frps_token(server_id: &str, token: &str) -> Result<(), String> {
     set_keyring_secret(&frps_token_account(server_id), token)
 }
 
 /// Fetch the frps auth token for building frpc configs.
-pub fn get_frps_token(app: &tauri::AppHandle, server_id: &str) -> Result<String, String> {
-    let _ = app;
+pub fn get_frps_token(server_id: &str) -> Result<String, String> {
     get_keyring_secret(&frps_token_account(server_id))
 }
 
@@ -209,27 +170,17 @@ fn tunnel_auth_account(tunnel_id: &str) -> String {
 }
 
 /// Store (or replace) the basic-auth password for a tunnel.
-pub fn set_tunnel_auth_password(
-    app: &tauri::AppHandle,
-    tunnel_id: &str,
-    password: &str,
-) -> Result<(), String> {
-    let _ = app;
+pub fn set_tunnel_auth_password(tunnel_id: &str, password: &str) -> Result<(), String> {
     set_keyring_secret(&tunnel_auth_account(tunnel_id), password)
 }
 
 /// Fetch the basic-auth password for a tunnel, `Ok(None)` when not set.
-pub fn get_tunnel_auth_password(
-    app: &tauri::AppHandle,
-    tunnel_id: &str,
-) -> Result<Option<String>, String> {
-    let _ = app;
+pub fn get_tunnel_auth_password(tunnel_id: &str) -> Result<Option<String>, String> {
     crate::secrets_store::try_get(&tunnel_auth_account(tunnel_id))
 }
 
 /// Delete the basic-auth password when a tunnel's auth is removed.
-pub fn delete_tunnel_auth_password(app: &tauri::AppHandle, tunnel_id: &str) -> Result<(), String> {
-    let _ = app;
+pub fn delete_tunnel_auth_password(tunnel_id: &str) -> Result<(), String> {
     delete_keyring_secret(&tunnel_auth_account(tunnel_id))
 }
 

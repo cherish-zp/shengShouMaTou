@@ -20,11 +20,12 @@
 // Public signatures below are frozen — commands.rs and providers.rs /
 // engine.rs code against them.
 //
-// Blocking model: the tauri commands calling this module are SYNC, so every
-// HTTP-touching public function drives its async body the same way
-// `binman::install` does — on a dedicated worker thread running a
-// current-thread tokio runtime, result passed back over a channel. Keychain
-// helpers are plain blocking calls (no runtime needed).
+// Blocking model: the sync tauri commands call these functions via
+// `tauri::async_runtime::spawn_blocking` (see commands.rs). Every blocking
+// entry point drives its async body the same way `binman::install` does — on
+// a dedicated worker thread running a current-thread tokio runtime, result
+// passed back over a channel. Keychain helpers are plain blocking calls (no
+// runtime needed).
 
 use std::time::Duration;
 
@@ -33,13 +34,9 @@ use serde::Deserialize;
 use crate::models::{CfAccount, CfProvisionInput, CfZone, TunnelConfig};
 
 const API_BASE: &str = "https://api.cloudflare.com/client/v4";
-/// HTTP header values must be visible ASCII, so the Chinese display name
-/// cannot be used here — the latin executable name stands in for it.
-const USER_AGENT: &str = concat!("ShengShouMaTou/", env!("CARGO_PKG_VERSION"));
-/// Only bounds the TCP/TLS handshake; API payloads are small JSON.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Whole-request cap: API payloads are small JSON — anything slower is a
-/// hung connection and must not stall a tunnel start forever.
+/// hung connection and must not stall a tunnel start forever. Applied
+/// per-request on top of the shared client (see util::http_client).
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Hard cap on zone-list pages (50/page => 2000 zones) so a misbehaving
 /// server reporting an ever-growing `total_pages` cannot spin forever.
@@ -203,8 +200,11 @@ async fn cf_request(
     json: Option<serde_json::Value>,
 ) -> Result<CfEnvelope, CfApiError> {
     let url = format!("{API_BASE}{path}");
-    let client = http_client()?;
-    let mut req = client.request(method, &url).bearer_auth(token);
+    let client = crate::util::http_client();
+    let mut req = client
+        .request(method, &url)
+        .timeout(REQUEST_TIMEOUT)
+        .bearer_auth(token);
     // reqwest runs without the `json` feature, so the payload is serialized
     // here with serde_json directly (same wire format either way).
     if let Some(body) = json {
@@ -245,15 +245,6 @@ async fn cf_request(
         });
     }
     Ok(envelope)
-}
-
-fn http_client() -> Result<reqwest::Client, CfApiError> {
-    reqwest::Client::builder()
-        .user_agent(USER_AGENT)
-        .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(REQUEST_TIMEOUT)
-        .build()
-        .map_err(|e| CfApiError::plain(format!("failed to build HTTP client: {e}")))
 }
 
 // ---------------------------------------------------------------------------
@@ -532,19 +523,6 @@ pub fn resolve_zone_id(token: &str, hostname: &str) -> Result<String, String> {
 /// Read the stored API token for a tunnel (frontend "eye" reveal).
 pub fn stored_api_token(tunnel_id: &str) -> Result<String, String> {
     keychain_get(&api_token_account(tunnel_id))
-}
-
-/// Query remote tunnel health ("inactive" | "degraded" | "healthy" | "down").
-/// Part of the frozen module contract; its caller (settings-page health
-/// badge) lands with the frontend milestone — the stub carried the same
-/// dead-code state.
-#[allow(dead_code)]
-pub fn tunnel_status(token: &str, tunnel_id: &str) -> Result<String, String> {
-    let token = require_token(token)?;
-    let tunnel_id = tunnel_id.trim().to_string();
-    run_blocking("cf-tunnel-status", async move {
-        tunnel_status_async(&token, &tunnel_id).await
-    })
 }
 
 /// Retarget the first origin ingress rule of the tunnel's remote
@@ -851,26 +829,6 @@ async fn deprovision_async(
         ));
     }
     Ok(())
-}
-
-// Only reachable through `tunnel_status` (see the allow above).
-#[allow(dead_code)]
-async fn tunnel_status_async(token: &str, tunnel_id: &str) -> Result<String, String> {
-    let account_id = resolve_account_for_tunnel(token, tunnel_id).await?;
-    let result = cf_request(
-        reqwest::Method::GET,
-        token,
-        &format!("/accounts/{account_id}/cfd_tunnel/{tunnel_id}"),
-        None,
-    )
-    .await
-    .map_err(|e| e.to_string())?
-    .result;
-    result
-        .get("status")
-        .and_then(|s| s.as_str())
-        .map(str::to_string)
-        .ok_or_else(|| "隧道状态响应缺少 status 字段".to_string())
 }
 
 async fn update_ingress_service_async(
