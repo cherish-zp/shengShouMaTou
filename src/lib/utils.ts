@@ -1,9 +1,6 @@
-import { clsx, type ClassValue } from "clsx";
-import { twMerge } from "tailwind-merge";
-
-export function cn(...inputs: ClassValue[]) {
-  return twMerge(clsx(inputs));
-}
+// cn 包（shadcn 出品）是 clsx + tailwind-merge 的编译版替代，
+// 签名同为 (...inputs: ClassValue[]) => string，此处统一转发。
+export { cn } from "cn";
 
 export function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes < 0) return "0 B";

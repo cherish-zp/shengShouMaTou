@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { memo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
   Activity,
@@ -65,7 +65,7 @@ interface TunnelCardProps {
 
 const ACTIVE_STATUSES = new Set(["running", "starting", "reconnecting"]);
 
-export function TunnelCard({ tunnel, state, onEdit, onShowLogs, onDelete }: TunnelCardProps) {
+function TunnelCardBase({ tunnel, state, onEdit, onShowLogs, onDelete }: TunnelCardProps) {
   const { t } = useTranslation();
   const [busy, setBusy] = useState(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
@@ -442,3 +442,7 @@ export function TunnelCard({ tunnel, state, onEdit, onShowLogs, onDelete }: Tunn
     </Card>
   );
 }
+
+// Props are stable (memoized handlers + store data), so memo skips
+// re-rendering every card when a single tunnel's state ticks.
+export const TunnelCard = memo(TunnelCardBase);

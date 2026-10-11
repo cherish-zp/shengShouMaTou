@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { FileUp, Plus } from "lucide-react";
 
@@ -34,20 +34,27 @@ export function HomePage() {
     }
   }, []);
 
+  // Handlers passed to TunnelCard are memoized (with state-setter-only deps)
+  // so React.memo on TunnelCard can skip re-renders of untouched cards.
   const openCreate = () => {
     setEditTunnel(null);
     setDialogOpen(true);
   };
 
-  const openEdit = (tunnel: TunnelConfig) => {
+  const openEdit = useCallback((tunnel: TunnelConfig) => {
     setEditTunnel(tunnel);
     setDialogOpen(true);
-  };
+  }, []);
 
-  const openLogs = (tunnel: TunnelConfig) => {
+  const openLogs = useCallback((tunnel: TunnelConfig) => {
     setLogTunnel(tunnel);
     setLogOpen(true);
-  };
+  }, []);
+
+  // removeConfig is a module-level store function (stable reference).
+  const handleDelete = useCallback((deleted: TunnelConfig) => {
+    removeConfig(deleted.id);
+  }, []);
 
   return (
     <div className="mx-auto flex w-full max-w-3xl flex-col px-8 py-10">
@@ -86,7 +93,7 @@ export function HomePage() {
               state={states[tunnel.id]}
               onEdit={openEdit}
               onShowLogs={openLogs}
-              onDelete={(deleted) => removeConfig(deleted.id)}
+              onDelete={handleDelete}
             />
           ))}
         </section>

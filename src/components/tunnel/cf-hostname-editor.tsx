@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Check, Eye, EyeOff, Globe, Loader2 } from "lucide-react";
+import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -70,7 +71,7 @@ export function CfHostnameEditor({
     }
   };
 
-  const toastError = (msg: string) => import("sonner").then(({ toast }) => toast.error(msg));
+  const toastError = (msg: string) => toast.error(msg);
 
   const save = async () => {
     if (!changed) return;

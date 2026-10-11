@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import QRCode from "qrcode";
 import { QrCode } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -26,14 +25,24 @@ export function QrPopover({ url, disabled }: QrPopoverProps) {
   useEffect(() => {
     if (!open || !url || !canvasRef.current) return;
     const canvas = canvasRef.current;
-    QRCode.toCanvas(canvas, url, {
-      width: QR_SIZE,
-      margin: 2,
-      color: { dark: "#18181bff", light: "#ffffffff" },
-      errorCorrectionLevel: "M",
-    }).catch(() => {
-      // Rendering failure leaves the canvas blank; URL is still shown below.
-    });
+    // qrcode is loaded on demand: only needed when the popover actually renders.
+    let cancelled = false;
+    import("qrcode")
+      .then((QRCode) => {
+        if (cancelled) return;
+        return QRCode.default.toCanvas(canvas, url, {
+          width: QR_SIZE,
+          margin: 2,
+          color: { dark: "#18181bff", light: "#ffffffff" },
+          errorCorrectionLevel: "M",
+        });
+      })
+      .catch(() => {
+        // Rendering failure leaves the canvas blank; URL is still shown below.
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [open, url]);
 
   return (
