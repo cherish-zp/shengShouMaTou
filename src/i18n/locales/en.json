@@ -454,6 +454,9 @@
     "installing": "Installing…",
     "installFailed": "Engine installation failed",
     "installSuccess": "Engine installed",
+    "importBinary": "Import binary",
+    "importSuccess": "{{name}} imported successfully",
+    "importFailed": "Import failed",
     "loadFailed": "Failed to load engine status",
     "storage": {
       "title": "Storage Usage",

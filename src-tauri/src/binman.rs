@@ -6,18 +6,25 @@
 //   * `binary_file_name` — engine binary file name for the current platform
 //   * `read_status`      — install state of both engines
 //   * `install`          — download + unpack + swap-in an engine binary
+//   * `import_binary`    — install a user-provided engine file (manual import)
 //
-// Download sources (verified on 2026-10-06, all HTTP 200):
+// Download sources (see DOWNLOAD_SOURCE_TEMPLATES for the ordered list):
+// every attempt goes direct first, then public GitHub mirrors; a source only
+// counts as successful when download + unpack + magic check + `probe_version`
+// all pass, otherwise the next source is tried. bore/frp resolve their latest
+// tag via the GitHub API (direct only); when the API is unreachable they fall
+// back to the last human-verified pinned tag (BORE_FALLBACK_TAG /
+// FRP_FALLBACK_TAG) and a `releases/download/<tag>/<asset>` direct link.
+// Asset naming (verified on 2026-10-06, all HTTP 200):
 //   cloudflared: https://github.com/cloudflare/cloudflared/releases/latest/download/<asset>
 //     - cloudflared-darwin-arm64.tgz  (contains `cloudflared` at archive root)
 //     - cloudflared-darwin-amd64.tgz
 //     - cloudflared-windows-amd64.exe (plain binary, no unpacking)
-//   bore: https://github.com/ekzhang/bore/releases (resolved via the GitHub API)
+//   bore: https://github.com/ekzhang/bore/releases
 //     - bore-v0.6.0-aarch64-apple-darwin.tar.gz  (contains `bore` at archive root)
 //     - bore-v0.6.0-x86_64-apple-darwin.tar.gz
 //     - bore-v0.6.0-x86_64-pc-windows-msvc.zip
-//   frp: https://github.com/fatedier/frp/releases (resolved via the GitHub API;
-//   asset names verified on 2026-10-06, all HTTP 200, tag v0.71.0 — note the
+//   frp: https://github.com/fatedier/frp/releases (tag v0.71.0 — note the
 //   asset version carries NO `v` prefix while the tag does):
 //     - frp_0.71.0_darwin_arm64.tar.gz
 //     - frp_0.71.0_windows_amd64.zip / frp_0.71.0_windows_arm64.zip
@@ -28,6 +35,7 @@
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
 use tauri::Manager;
@@ -38,6 +46,33 @@ const CLOUDFLARED_LATEST_URL: &str =
     "https://github.com/cloudflare/cloudflared/releases/latest/download";
 const BORE_RELEASE_API_URL: &str = "https://api.github.com/repos/ekzhang/bore/releases/latest";
 const FRP_RELEASE_API_URL: &str = "https://api.github.com/repos/fatedier/frp/releases/latest";
+
+/// bore/frp 查不到最新版本时的兜底 tag：API 只走直连、不走镜像（公益镜像
+/// 不保证代理 JSON API），API 不可达时改用这些「最近一次人工验证可用」的
+/// tag 直拼 `releases/download/<tag>/<asset>` 直链。版本可能落后于最新，
+/// 但始终可用；资产命名规则见 `bore_asset_name` / `frp_asset_name`。
+const BORE_FALLBACK_TAG: &str = "v0.6.0";
+const FRP_FALLBACK_TAG: &str = "v0.71.0";
+
+/// 引擎下载源模板（有序，逐个回退）。`{url}` 占位符会被替换为完整原始
+/// URL（asset 直链），空模板 = 直连 GitHub。顺序即优先级：先直连，再镜像。
+///
+/// 风险说明：gh-proxy.com / ghfast.top 是第三方公益镜像，随时可能失效、
+/// 限速或返回 200 + HTML 错误页 —— 因此任一源「下载成功」都不算数，
+/// 必须解包 + 魔数校验 + `probe_version` 探测全部通过才算安装成功，
+/// 任一环节失败即清理暂存并自动换下一个源（循环天然构成重试）。
+/// 增删镜像时只改这一处常量。
+const DOWNLOAD_SOURCE_TEMPLATES: &[&str] = &[
+    "",
+    "https://gh-proxy.com/{url}",
+    "https://ghfast.top/{url}",
+    "https://ghproxy.net/{url}",
+];
+
+/// 单个源的下载整体超时（大文件 300s）：镜像挂起时不能卡死整条回退链。
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
+/// GitHub API（JSON 小响应）的整体超时（小文件 120s）。
+const API_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Filename of the engine binary for `backend` on the current platform.
 pub fn binary_file_name(backend: Backend) -> &'static str {
@@ -223,21 +258,19 @@ fn probe_version(path: &Path) -> Option<String> {
 }
 
 pub fn read_status(app: &tauri::AppHandle) -> Result<BinaryStatus, String> {
-    let info = |backend: Backend| {
-        match resolve(app, backend) {
-            Ok(path) => BinaryInfo {
-                backend,
-                version: probe_version(&path),
-                path: Some(path.to_string_lossy().to_string()),
-                installed: true,
-            },
-            Err(_) => BinaryInfo {
-                backend,
-                version: None,
-                path: None,
-                installed: false,
-            },
-        }
+    let info = |backend: Backend| match resolve(app, backend) {
+        Ok(path) => BinaryInfo {
+            backend,
+            version: probe_version(&path),
+            path: Some(path.to_string_lossy().to_string()),
+            installed: true,
+        },
+        Err(_) => BinaryInfo {
+            backend,
+            version: None,
+            path: None,
+            installed: false,
+        },
     };
     Ok(BinaryStatus {
         cloudflare: info(Backend::Cloudflare),
@@ -281,68 +314,209 @@ async fn install_async(app: &tauri::AppHandle, backend: Backend) -> Result<Binar
     })
 }
 
-/// Resolve the release asset for `backend`, download, unpack and swap it into
-/// `dir`. Returns the path of the installed binary.
-async fn install_to_dir(dir: &Path, backend: Backend) -> Result<PathBuf, String> {
+/// 手动导入：把用户从官方渠道下载的引擎文件安装进 `<app_data_dir>/bin`。
+///
+/// 流程：路径校验 → 复制到 `<final>.staging`（不破坏用户原文件）→
+/// 平台魔数校验 → chmod → `probe_version` 探测 → 原子换装（.bak 回滚
+/// 保护）。探测失败返回中文 Err，由设置页如实提示。
+pub fn import_binary(
+    app: &tauri::AppHandle,
+    backend: Backend,
+    src: &str,
+) -> Result<BinaryStatus, String> {
+    let dir = bin_dir(app)?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("创建引擎目录 {} 失败：{e}", dir.display()))?;
+
+    let src_path = PathBuf::from(src);
+    if !src_path.is_file() {
+        return Err(format!("所选路径不存在或不是文件：{src}"));
+    }
+    let final_name = binary_file_name(backend);
+    let staged_path = dir.join(format!("{final_name}.staging"));
+
+    // 清掉上次失败遗留的暂存文件，避免把旧数据当新文件探测。
+    let _ = std::fs::remove_file(&staged_path);
+
+    std::fs::copy(&src_path, &staged_path).map_err(|e| {
+        format!(
+            "复制 {} 到 {} 失败：{e}",
+            src_path.display(),
+            staged_path.display()
+        )
+    })?;
+
+    let verified = (|| -> Result<(), String> {
+        // 平台魔数先行：直接拦截 HTML 错误页、README、其他平台的二进制。
+        validate_file_magic(&staged_path)?;
+        make_executable(&staged_path)?;
+        // 最终裁决：该文件必须真能以 <backend> 引擎的身份回答 --version。
+        if probe_version(&staged_path).is_none() {
+            return Err(format!(
+                "该文件不是有效的 {final_name} 引擎可执行文件（--version 探测失败）"
+            ));
+        }
+        Ok(())
+    })();
+    if let Err(e) = verified {
+        let _ = std::fs::remove_file(&staged_path);
+        return Err(e);
+    }
+
+    swap_staged_into_place(&dir, final_name, &staged_path)?;
+    read_status(app)
+}
+
+/// GitHub `releases/download/<tag>/<asset>` 直链（pinned tag 兜底用）。
+fn github_pinned_download_url(repo: &str, tag: &str, asset: &str) -> String {
+    format!("https://github.com/{repo}/releases/download/{tag}/{asset}")
+}
+
+/// bore/frp 共用：查最新 release 取 asset 直链；API 不可达时不放弃，
+/// 改用 `fallback_tag` 直拼 `releases/download/<tag>/<asset>` 直链
+/// （资产命名规则固定，见 `bore_asset_name` / `frp_asset_name`）。
+/// `asset_name_for(tag, os, arch)` 给出该平台对应的 asset 文件名。
+async fn resolve_via_api_or_pinned(
+    api_url: &str,
+    project: &str,
+    repo: &str,
+    fallback_tag: &str,
+    os: &str,
+    arch: &str,
+    asset_name_for: fn(&str, &str, &str) -> Option<String>,
+) -> Result<(String, String), String> {
+    let asset_for = |tag: &str| {
+        asset_name_for(tag, os, arch)
+            .ok_or_else(|| format!("{project} publishes no official build for this platform"))
+    };
+    match fetch_latest_github_release(api_url, project).await {
+        Ok(release) => {
+            let asset = asset_for(&release.tag_name)?;
+            match release.assets.iter().find(|a| a.name == asset) {
+                Some(a) => Ok((a.name.clone(), a.browser_download_url.clone())),
+                None => {
+                    let names: Vec<&str> = release.assets.iter().map(|a| a.name.as_str()).collect();
+                    Err(format!(
+                        "{project} release {} does not contain the expected asset {asset:?} \
+                         (available: {})",
+                        release.tag_name,
+                        names.join(", ")
+                    ))
+                }
+            }
+        }
+        Err(api_err) => {
+            eprintln!(
+                "[pier] {project} 最新版本查询失败（{api_err}），改用已验证版本 {fallback_tag} 的 GitHub 直链"
+            );
+            let asset = asset_for(fallback_tag)?;
+            Ok((
+                asset.clone(),
+                github_pinned_download_url(repo, fallback_tag, &asset),
+            ))
+        }
+    }
+}
+
+/// 解析 `backend` 的 GitHub asset（asset 文件名 + 下载 URL）。
+///
+/// cloudflared 本就无需 API（`releases/latest/download/<asset>` 直链）；
+/// bore/frp 需要先查 API 拿最新 tag，API 失败时回退到已验证的 pinned tag。
+async fn resolve_asset_url(backend: Backend) -> Result<(String, String), String> {
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
 
-    let (asset_name, url) = match backend {
+    match backend {
         Backend::Cloudflare | Backend::CloudflareNamed => {
             let asset = cloudflared_asset_name(os, arch).ok_or_else(|| {
                 "cloudflared publishes no official build for this platform".to_string()
             })?;
             let url = format!("{CLOUDFLARED_LATEST_URL}/{asset}");
-            (asset.to_string(), url)
+            Ok((asset.to_string(), url))
         }
         // frp releases carry a top-level directory inside the archive; the
         // unpacker matches the binary by file name, so it sees through it.
         Backend::Frp => {
-            let release = fetch_latest_github_release(FRP_RELEASE_API_URL, "frp").await?;
-            let asset = frp_asset_name(&release.tag_name, os, arch).ok_or_else(|| {
-                "frp publishes no official build for this platform".to_string()
-            })?;
-            match release.assets.iter().find(|a| a.name == asset) {
-                Some(a) => (a.name.clone(), a.browser_download_url.clone()),
-                None => {
-                    let names: Vec<&str> = release.assets.iter().map(|a| a.name.as_str()).collect();
-                    return Err(format!(
-                        "frp release {} does not contain the expected asset {asset:?} \
-                         (available: {})",
-                        release.tag_name,
-                        names.join(", ")
-                    ));
-                }
-            }
+            resolve_via_api_or_pinned(
+                FRP_RELEASE_API_URL,
+                "frp",
+                "fatedier/frp",
+                FRP_FALLBACK_TAG,
+                os,
+                arch,
+                frp_asset_name,
+            )
+            .await
         }
         Backend::Bore => {
-            let release = fetch_latest_bore_release().await?;
-            let asset = bore_asset_name(&release.tag_name, os, arch).ok_or_else(|| {
-                "bore publishes no official build for this platform".to_string()
-            })?;
-            match release.assets.iter().find(|a| a.name == asset) {
-                Some(a) => (a.name.clone(), a.browser_download_url.clone()),
-                None => {
-                    let names: Vec<&str> = release.assets.iter().map(|a| a.name.as_str()).collect();
-                    return Err(format!(
-                        "bore release {} does not contain the expected asset {asset:?} \
-                         (available: {})",
-                        release.tag_name,
-                        names.join(", ")
-                    ));
-                }
+            resolve_via_api_or_pinned(
+                BORE_RELEASE_API_URL,
+                "bore",
+                "ekzhang/bore",
+                BORE_FALLBACK_TAG,
+                os,
+                arch,
+                bore_asset_name,
+            )
+            .await
+        }
+    }
+}
+
+/// 把下载源模板里的 `{url}` 占位符替换为完整原始 URL（镜像前缀拼在完整
+/// 原始 URL 之前，形如 `https://gh-proxy.com/https://github.com/...`）。
+/// 空模板 = 直连，原样返回。
+fn apply_source_template(template: &str, url: &str) -> String {
+    if template.is_empty() {
+        url.to_string()
+    } else {
+        template.replace("{url}", url)
+    }
+}
+
+/// 多源回退循环：按 `DOWNLOAD_SOURCE_TEMPLATES` 的顺序（直连 → 镜像）
+/// 依次以拼接后的完整 URL 调用 `try_one`；任一源成功立即返回，
+/// 全部失败返回中文错误，内含每个源的具体失败原因与「手动导入」建议。
+async fn try_sources<T, F, Fut>(original_url: &str, mut try_one: F) -> Result<T, String>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    let mut failures: Vec<String> = Vec::new();
+    for template in DOWNLOAD_SOURCE_TEMPLATES {
+        let source = apply_source_template(template, original_url);
+        match try_one(source.clone()).await {
+            Ok(value) => return Ok(value),
+            Err(e) => {
+                eprintln!("[pier] 下载源失败 {source}：{e}，尝试下一个源");
+                failures.push(format!("{source}（{e}）"));
             }
         }
-    };
+    }
+    Err(format!(
+        "所有下载源均失败（共 {} 个）：{}。请检查网络后重试，或在设置页手动导入官方渠道下载的引擎文件。",
+        failures.len(),
+        failures.join("；")
+    ))
+}
 
-    fetch_and_unpack(
-        &url,
-        &asset_name,
-        dir,
-        archive_inner_name(backend),
-        binary_file_name(backend),
-    )
-    .await
+/// Resolve the release asset for `backend`, download (with per-source
+/// fallback), unpack, probe and swap it into `dir`. Returns the path of the
+/// installed binary.
+async fn install_to_dir(dir: &Path, backend: Backend) -> Result<PathBuf, String> {
+    let (asset_name, url) = resolve_asset_url(backend).await?;
+    let asset_name = &asset_name; // 借用即可被每个源的未来复制，闭包可重复调用
+    let inner_name = archive_inner_name(backend);
+    let final_name = binary_file_name(backend);
+
+    // 成功标准 = 下载 + 解包 + 魔数校验 + `probe_version` 全部通过；
+    // 任一环节失败都会清理暂存文件并由 try_sources 换下一个源。
+    let staged_path = try_sources(&url, |source| async move {
+        attempt_one_source(&source, asset_name, dir, inner_name, final_name).await
+    })
+    .await?;
+
+    swap_staged_into_place(dir, final_name, &staged_path)
 }
 
 #[derive(Debug, Deserialize)]
@@ -362,74 +536,132 @@ async fn fetch_latest_github_release(
     api_url: &str,
     project: &str,
 ) -> Result<GitHubRelease, String> {
-    let body = crate::util::fetch_github_release_text(api_url, None).await?;
+    let body = crate::util::fetch_github_release_text(api_url, Some(API_TIMEOUT)).await?;
     serde_json::from_str(&body)
         .map_err(|e| format!("could not parse the {project} release info: {e}"))
 }
 
-async fn fetch_latest_bore_release() -> Result<GitHubRelease, String> {
-    fetch_latest_github_release(BORE_RELEASE_API_URL, "bore").await
+/// 平台可执行文件的魔数校验（纯函数，便于测试）：只放行当前平台的
+/// 可执行格式，优先、明确地拒绝 HTML 错误页与任意垃圾数据。
+/// 注意用 `cfg!` 运行时分支而非 `#[cfg]`，三个平台分支都参与编译，
+/// 测试在任何平台上都能覆盖全部魔数。
+fn check_magic_bytes(header: &[u8]) -> Result<(), String> {
+    // HTML 错误页是镜像/下载源失效时最常见的响应体（`<`/`<!` 开头均覆盖）。
+    if header.first() == Some(&b'<') {
+        return Err("文件内容是 HTML/文本（疑似下载源的错误页），不是可执行文件".to_string());
+    }
+    if cfg!(target_os = "macos") {
+        // Mach-O 64 位（cf fa ed fe）与 universal/fat header（ca fe ba be）。
+        if header.starts_with(&[0xCF, 0xFA, 0xED, 0xFE])
+            || header.starts_with(&[0xCA, 0xFE, 0xBA, 0xBE])
+        {
+            return Ok(());
+        }
+        Err("不是有效的 macOS 可执行文件（Mach-O）".to_string())
+    } else if cfg!(target_os = "windows") {
+        if header.starts_with(b"MZ") {
+            return Ok(());
+        }
+        Err("不是有效的 Windows 可执行文件（PE/MZ）".to_string())
+    } else {
+        if header.starts_with(&[0x7F, 0x45, 0x4C, 0x46]) {
+            return Ok(());
+        }
+        Err("不是有效的 Linux 可执行文件（ELF）".to_string())
+    }
 }
 
-/// Stream `url` into `dest`, then unpack the engine binary into place.
-///
-/// Pipeline (all intermediates live next to the final binary):
-///   1. stream download -> `<final>.download`
-///   2. unpack           -> `<final>.staging` (+ chmod 0755 on unix)
-///   3. existing binary  -> `<final>.bak`
-///   4. rename staging   -> `<final>` (atomic; the backup is rolled back if
-///      this fails, then removed on success)
-async fn fetch_and_unpack(
-    url: &str,
+/// 读取文件前 8 字节并做平台魔数校验（拦 HTML 错误页 / 非可执行数据）。
+fn validate_file_magic(path: &Path) -> Result<(), String> {
+    use std::io::Read;
+    let mut file =
+        std::fs::File::open(path).map_err(|e| format!("无法读取文件 {}：{e}", path.display()))?;
+    let mut header = [0u8; 8];
+    let n = file
+        .read(&mut header)
+        .map_err(|e| format!("读取文件头 {} 失败：{e}", path.display()))?;
+    check_magic_bytes(&header[..n])
+}
+
+/// 单个下载源的完整尝试：下载 → 解包到暂存 → 魔数校验 → chmod →
+/// `probe_version` 探测。成功返回暂存文件路径；任何一步失败都清理
+/// 暂存文件并返回错误（由 `try_sources` 汇总后换下一个源）。
+async fn attempt_one_source(
+    source_url: &str,
     asset_name: &str,
     dir: &Path,
     inner_name: &str,
     final_name: &str,
 ) -> Result<PathBuf, String> {
-    let final_path = dir.join(final_name);
     let download_path = dir.join(format!("{final_name}.download"));
     let staged_path = dir.join(format!("{final_name}.staging"));
 
-    // 大文件下载：不设整体超时，仅保留共享客户端的 30s 连接超时。
-    crate::util::download_to_file(url, &download_path, None).await?;
+    // 整体 300s 超时：镜像挂起时不能卡死整条回退链。
+    if let Err(e) =
+        crate::util::download_to_file(source_url, &download_path, Some(DOWNLOAD_TIMEOUT)).await
+    {
+        let _ = std::fs::remove_file(&download_path);
+        return Err(e);
+    }
 
-    let unpack = match archive_kind(asset_name) {
+    let unpacked = match archive_kind(asset_name) {
         ArchiveKind::Plain => {
             // The asset is the binary itself.
             std::fs::rename(&download_path, &staged_path)
-                .map_err(|e| format!("failed to move the downloaded file into place: {e}"))
+                .map_err(|e| format!("移动已下载文件到暂存位置失败：{e}"))
         }
         ArchiveKind::TarGz => unpack_tar_gz(&download_path, inner_name, &staged_path),
         ArchiveKind::Zip => unpack_zip(&download_path, inner_name, &staged_path),
     };
     // The archive is no longer needed either way.
     let _ = std::fs::remove_file(&download_path);
-    if let Err(e) = unpack {
+    if let Err(e) = unpacked {
+        let _ = std::fs::remove_file(&staged_path);
+        return Err(e);
+    }
+
+    // 镜像失效时最常见的坑：200 + HTML 错误页被当二进制落盘，魔数先行拦截。
+    if let Err(e) = validate_file_magic(&staged_path) {
         let _ = std::fs::remove_file(&staged_path);
         return Err(e);
     }
 
     make_executable(&staged_path)?;
 
+    // 成功标准：--version 能给出非空输出。HTML 伪装、平台不对、包损坏
+    // 都会在这一步暴露，然后由调用方换下一个源。
+    if probe_version(&staged_path).is_none() {
+        let _ = std::fs::remove_file(&staged_path);
+        return Err(format!(
+            "下载成功但 {final_name} --version 探测失败（疑似损坏或非本平台的可执行文件）"
+        ));
+    }
+    Ok(staged_path)
+}
+
+/// 把暂存好的二进制原子换装到 `dir/<final_name>`：旧文件先挪 `.bak`，
+/// rename 失败回滚 `.bak`，成功后删除。返回最终安装路径。
+fn swap_staged_into_place(
+    dir: &Path,
+    final_name: &str,
+    staged_path: &Path,
+) -> Result<PathBuf, String> {
+    let final_path = dir.join(final_name);
     let backup_path = dir.join(format!("{final_name}.bak"));
     let had_old = final_path.exists();
     if had_old {
         let _ = std::fs::remove_file(&backup_path);
-        std::fs::rename(&final_path, &backup_path).map_err(|e| {
-            format!(
-                "failed to back up the existing binary at {}: {e}",
-                final_path.display()
-            )
-        })?;
+        std::fs::rename(&final_path, &backup_path)
+            .map_err(|e| format!("备份现有引擎文件 {} 失败：{e}", final_path.display()))?;
     }
-    if let Err(e) = std::fs::rename(&staged_path, &final_path) {
+    if let Err(e) = std::fs::rename(staged_path, &final_path) {
         // Keep the old binary usable if the swap fails.
         if had_old {
             let _ = std::fs::rename(&backup_path, &final_path);
         }
-        let _ = std::fs::remove_file(&staged_path);
+        let _ = std::fs::remove_file(staged_path);
         return Err(format!(
-            "failed to move the new binary into place at {}: {e}",
+            "安装新引擎文件到 {} 失败：{e}",
             final_path.display()
         ));
     }
@@ -473,8 +705,7 @@ fn unpack_tar_gz(archive: &Path, inner_name: &str, dest: &Path) -> Result<(), St
         .entries()
         .map_err(|e| format!("failed to read the tar archive {}: {e}", archive.display()))?;
     for entry in entries {
-        let mut entry =
-            entry.map_err(|e| format!("failed to read a tar entry: {e}"))?;
+        let mut entry = entry.map_err(|e| format!("failed to read a tar entry: {e}"))?;
         if !entry.header().entry_type().is_file() {
             // Skips directories, symlinks, hardlinks, etc.
             continue;
@@ -626,7 +857,10 @@ mod tests {
 
     #[test]
     fn archive_kind_is_detected_from_extension() {
-        assert_eq!(archive_kind("cloudflared-darwin-arm64.tgz"), ArchiveKind::TarGz);
+        assert_eq!(
+            archive_kind("cloudflared-darwin-arm64.tgz"),
+            ArchiveKind::TarGz
+        );
         assert_eq!(
             archive_kind("bore-v0.6.0-aarch64-apple-darwin.tar.gz"),
             ArchiveKind::TarGz
@@ -635,7 +869,10 @@ mod tests {
             archive_kind("bore-v0.6.0-x86_64-pc-windows-msvc.zip"),
             ArchiveKind::Zip
         );
-        assert_eq!(archive_kind("cloudflared-windows-amd64.exe"), ArchiveKind::Plain);
+        assert_eq!(
+            archive_kind("cloudflared-windows-amd64.exe"),
+            ArchiveKind::Plain
+        );
         assert_eq!(archive_kind("cloudflared-linux-amd64"), ArchiveKind::Plain);
     }
 
@@ -650,6 +887,137 @@ mod tests {
             } else {
                 assert_eq!(final_name, archive_inner_name(backend));
             }
+        }
+    }
+
+    #[test]
+    fn source_templates_build_direct_and_mirror_urls() {
+        // 直连：空模板原样返回完整原始 URL。
+        let raw = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz";
+        assert_eq!(
+            apply_source_template(DOWNLOAD_SOURCE_TEMPLATES[0], raw),
+            raw
+        );
+        // 镜像：`{url}` 占位符替换为完整原始 URL（前缀拼在整条 URL 之前）。
+        assert_eq!(
+            apply_source_template("https://gh-proxy.com/{url}", raw),
+            format!("https://gh-proxy.com/{raw}")
+        );
+        assert_eq!(
+            apply_source_template("https://ghfast.top/{url}", raw),
+            format!("https://ghfast.top/{raw}")
+        );
+        // API URL 同样适用（模板占位符语义与协议无关）。
+        assert_eq!(
+            apply_source_template("https://gh-proxy.com/{url}", BORE_RELEASE_API_URL),
+            format!("https://gh-proxy.com/{BORE_RELEASE_API_URL}")
+        );
+        // 源列表本身有序：直连在前，其后逐个镜像（https 模板以 /{url} 结尾）。
+        assert_eq!(DOWNLOAD_SOURCE_TEMPLATES.first(), Some(&""));
+        assert!(DOWNLOAD_SOURCE_TEMPLATES[1..]
+            .iter()
+            .all(|t| t.starts_with("https://") && t.ends_with("/{url}")));
+        // pinned tag 兜底直链的固定形态（bore/frp 的 API 不可达路径）。
+        assert_eq!(
+            github_pinned_download_url("fatedier/frp", "v0.71.0", "frp_0.71.0_darwin_arm64.tar.gz"),
+            "https://github.com/fatedier/frp/releases/download/v0.71.0/frp_0.71.0_darwin_arm64.tar.gz"
+        );
+        assert_eq!(
+            github_pinned_download_url("ekzhang/bore", BORE_FALLBACK_TAG, "bore"),
+            format!("https://github.com/ekzhang/bore/releases/download/{BORE_FALLBACK_TAG}/bore")
+        );
+    }
+
+    #[tokio::test]
+    async fn try_sources_tries_every_source_in_order_and_reports_all_failures() {
+        let mut seen: Vec<String> = Vec::new();
+        let result: Result<&str, String> = try_sources(
+            "https://github.com/x/y/releases/download/v1/eng",
+            |source| {
+                seen.push(source.clone());
+                std::future::ready(Err(format!("fail {source}")))
+            },
+        )
+        .await;
+        // 顺序固定：直连 → gh-proxy → ghfast，全部尝试后才报错。
+        assert_eq!(seen.len(), DOWNLOAD_SOURCE_TEMPLATES.len());
+        assert_eq!(seen[0], "https://github.com/x/y/releases/download/v1/eng");
+        assert_eq!(
+            seen[1],
+            "https://gh-proxy.com/https://github.com/x/y/releases/download/v1/eng"
+        );
+        assert_eq!(
+            seen[2],
+            "https://ghfast.top/https://github.com/x/y/releases/download/v1/eng"
+        );
+        // 全失败的错误必须中文、含源列表与手动导入建议。
+        let err = result.unwrap_err();
+        assert!(err.contains("所有下载源均失败"), "err: {err}");
+        assert!(err.contains("gh-proxy.com"), "err: {err}");
+        assert!(err.contains("ghfast.top"), "err: {err}");
+        assert!(err.contains("手动导入"), "err: {err}");
+        assert!(
+            err.contains("fail"),
+            "每个源的具体失败原因要在错误里: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn try_sources_stops_at_first_success() {
+        let mut calls = 0usize;
+        let result: Result<String, String> = try_sources("https://github.com/a/b", |source| {
+            calls += 1;
+            if calls == 2 {
+                // 第二个源（镜像）成功。
+                std::future::ready(Ok(source))
+            } else {
+                std::future::ready(Err(format!("fail {source}")))
+            }
+        })
+        .await;
+        assert_eq!(
+            result.unwrap(),
+            "https://gh-proxy.com/https://github.com/a/b"
+        );
+        assert_eq!(calls, 2, "成功后不得再尝试后续源");
+    }
+
+    #[test]
+    fn magic_check_rejects_html_and_garbage_on_every_platform() {
+        // HTML 错误页（镜像失效的常见产物）一律拒绝。
+        assert!(check_magic_bytes(b"<!DOCTYPE html><html>").is_err());
+        assert!(check_magic_bytes(b"<html><body>404</body></html>").is_err());
+        // 普通文本 / 空文件 / 短垃圾也必须拒绝。
+        assert!(check_magic_bytes(b"OK").is_err());
+        assert!(check_magic_bytes(&[]).is_err());
+        assert!(check_magic_bytes(&[0x00, 0x01]).is_err());
+    }
+
+    #[test]
+    fn magic_check_matches_current_platform_rules() {
+        let macho64 = [0xCF, 0xFA, 0xED, 0xFE, 0x00, 0x00, 0x00, 0x01];
+        let macho_fat = [0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x00, 0x00, 0x02];
+        let elf = [0x7F, 0x45, 0x4C, 0x46, 0x02, 0x01, 0x01, 0x00];
+        let mz = b"MZ\x90\x00\x03\x00\x00\x00";
+        let accepts = |h: &[u8]| check_magic_bytes(h).is_ok();
+
+        if cfg!(target_os = "macos") {
+            // 放行：Mach-O 64 位 + universal/fat。
+            assert!(accepts(&macho64));
+            assert!(accepts(&macho_fat));
+            // 拒绝：其他平台格式。
+            assert!(!accepts(&elf));
+            assert!(!accepts(mz));
+        } else if cfg!(target_os = "windows") {
+            assert!(accepts(mz));
+            assert!(!accepts(&macho64));
+            assert!(!accepts(&macho_fat));
+            assert!(!accepts(&elf));
+        } else {
+            assert!(accepts(&elf));
+            assert!(!accepts(&macho64));
+            assert!(!accepts(&macho_fat));
+            assert!(!accepts(mz));
         }
     }
 
@@ -677,7 +1045,10 @@ mod tests {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let mode = std::fs::metadata(&path).expect("stat binary").permissions().mode();
+                let mode = std::fs::metadata(&path)
+                    .expect("stat binary")
+                    .permissions()
+                    .mode();
                 assert_eq!(mode & 0o755, 0o755, "binary should be rwxr-xr-x");
             }
             // The freshly installed binary must answer --version.

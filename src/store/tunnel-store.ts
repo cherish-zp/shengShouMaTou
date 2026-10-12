@@ -26,6 +26,7 @@ interface TunnelStoreState {
   states: Record<string, TunnelState>;
   binaryStatus: BinaryStatus | null;
   installing: Record<Backend, boolean>;
+  importing: Record<Backend, boolean>;
 }
 
 const initialState: TunnelStoreState = {
@@ -34,11 +35,21 @@ const initialState: TunnelStoreState = {
   states: {},
   binaryStatus: null,
   installing: { cloudflare: false, bore: false, frp: false, cloudflareNamed: false },
+  importing: { cloudflare: false, bore: false, frp: false, cloudflareNamed: false },
 };
 
 let state: TunnelStoreState = initialState;
 const listeners = new Set<() => void>();
 let initPromise: Promise<void> | null = null;
+
+/** Display name i18n key per backend（导入成功 toast 用）. */
+const ENGINE_NAME_KEYS: Record<Backend, string> = {
+  cloudflare: "settings.engineCloudflare",
+  bore: "settings.engineBore",
+  frp: "settings.engineFrp",
+  // cloudflareNamed 与 cloudflare 共用 cloudflared，没有独立文案。
+  cloudflareNamed: "settings.engineCloudflare",
+};
 
 function emit() {
   for (const listener of listeners) listener();
@@ -160,13 +171,45 @@ export async function installEngine(backend: Backend): Promise<void> {
   try {
     const binaryStatus = await api.installBinary(backend);
     setState({ binaryStatus });
-    toast.success(i18n.t("settings.installSuccess"));
+    // 诚实状态：下载失败时后端现在会 reject，但 resolve 也要复核该引擎
+    // 是否真的装上了（cloudflareNamed 与 cloudflare 共用 cloudflared）。
+    const info =
+      backend === "cloudflareNamed"
+        ? binaryStatus.cloudflare
+        : binaryStatus[backend];
+    if (info?.installed) {
+      toast.success(i18n.t("settings.installSuccess"));
+    } else {
+      toast.error(i18n.t("settings.installFailed"));
+    }
   } catch (error) {
     toast.error(i18n.t("settings.installFailed"), {
       description: errorMessage(error),
     });
   } finally {
     setState({ installing: { ...state.installing, [backend]: false } });
+  }
+}
+
+/** Import a user-picked local engine binary (manual fallback path). */
+export async function importEngine(
+  backend: Backend,
+  path: string,
+): Promise<void> {
+  if (state.installing[backend] || state.importing[backend]) return;
+  setState({ importing: { ...state.importing, [backend]: true } });
+  try {
+    const binaryStatus = await api.importEngineBinary(backend, path);
+    setState({ binaryStatus });
+    toast.success(
+      i18n.t("settings.importSuccess", { name: i18n.t(ENGINE_NAME_KEYS[backend]) }),
+    );
+  } catch (error) {
+    toast.error(i18n.t("settings.importFailed"), {
+      description: errorMessage(error),
+    });
+  } finally {
+    setState({ importing: { ...state.importing, [backend]: false } });
   }
 }
 

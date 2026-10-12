@@ -14,7 +14,9 @@ import {
   Radio,
   Server,
   Sun,
+  Upload,
 } from "lucide-react";
+import { open } from "@tauri-apps/plugin-dialog";
 import { toast } from "sonner";
 import { useAppUpdater } from "@/composables/use-app-updater";
 import { StorageSection } from "@/components/settings/storage-section";
@@ -45,6 +47,7 @@ import {
 } from "@/i18n";
 import { cn, errorMessage } from "@/lib/utils";
 import {
+  importEngine,
   installEngine,
   refreshBinaryStatus,
   requestNewTunnel,
@@ -93,7 +96,7 @@ const ENGINE_META: Record<
 export function SettingsPage() {
   const { t, i18n } = useTranslation();
   const { theme, setTheme } = useTheme();
-  const { binaryStatus, installing } = useTunnelStore();
+  const { binaryStatus, installing, importing } = useTunnelStore();
   const updater = useAppUpdater();
   // Real app version from the Tauri runtime (tauri.conf.json), not hardcoded.
   const [appVersion, setAppVersion] = useState("");
@@ -208,6 +211,7 @@ export function SettingsPage() {
                   backend={backend}
                   info={binaryStatus?.[backend]}
                   installing={installing[backend]}
+                  importing={importing[backend]}
                 />
               </div>
             ))}
@@ -327,14 +331,26 @@ function EngineRow({
   backend,
   info,
   installing,
+  importing,
 }: {
   backend: Backend;
   info?: BinaryInfo;
   installing: boolean;
+  importing: boolean;
 }) {
   const { t } = useTranslation();
   const { icon: Icon, nameKey, descKey } = ENGINE_META[backend];
   const installed = info?.installed ?? false;
+
+  // 手动导入：文件选择器取消（返回 null）时静默返回，不弹错误。
+  async function handleImport() {
+    const path = await open({
+      multiple: false,
+      filters: [{ name: "Binary", extensions: ["*"] }],
+    });
+    if (!path) return;
+    await importEngine(backend, path);
+  }
 
   return (
     <div className="flex items-center gap-4">
@@ -376,21 +392,36 @@ function EngineRow({
           ) : null}
         </p>
       </div>
-      <Button
-        variant="outline"
-        size="sm"
-        disabled={installing || !info}
-        onClick={() => void installEngine(backend)}
-      >
-        {installing ? (
-          <>
+      <div className="flex shrink-0 items-center gap-2">
+        <Button
+          variant="ghost"
+          size="sm"
+          disabled={installing || importing}
+          onClick={() => void handleImport()}
+        >
+          {importing ? (
             <LoaderCircle className="size-3.5 animate-spin" />
-            {t("settings.installing")}
-          </>
-        ) : (
-          t(installed ? "settings.reinstall" : "settings.install")
-        )}
-      </Button>
+          ) : (
+            <Upload className="size-3.5" />
+          )}
+          {t("settings.importBinary")}
+        </Button>
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={installing || importing || !info}
+          onClick={() => void installEngine(backend)}
+        >
+          {installing ? (
+            <>
+              <LoaderCircle className="size-3.5 animate-spin" />
+              {t("settings.installing")}
+            </>
+          ) : (
+            t(installed ? "settings.reinstall" : "settings.install")
+          )}
+        </Button>
+      </div>
     </div>
   );
 }

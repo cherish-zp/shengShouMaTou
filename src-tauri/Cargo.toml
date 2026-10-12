@@ -51,6 +51,9 @@ base64 = "0.23.1"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 tauri-plugin-updater = "2.13.1"
 tauri-plugin-process = "2.4.0"
+# 设置页手动导入引擎的文件选择框（版本对齐现有插件系；npm 侧
+# @tauri-apps/plugin-dialog 由前端安装）。
+tauri-plugin-dialog = "2"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

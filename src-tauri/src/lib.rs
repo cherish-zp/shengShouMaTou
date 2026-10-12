@@ -29,6 +29,8 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        // 设置页「手动导入引擎」的文件选择框（前端 @tauri-apps/plugin-dialog）。
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             // 开机自启的实例带 --hidden 启动：窗口保持隐藏，仅托盘常驻。
@@ -66,6 +68,7 @@ pub fn run() {
             commands::list_states,
             commands::read_binary_status,
             commands::install_binary,
+            commands::import_engine_binary,
             commands::list_servers,
             commands::add_server,
             commands::remove_server,

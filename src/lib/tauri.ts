@@ -45,6 +45,9 @@ export const api = {
   readBinaryStatus: () => invoke<BinaryStatus>("read_binary_status"),
   installBinary: (backend: Backend) =>
     invoke<BinaryStatus>("install_binary", { backend }),
+  // 手动导入本地已有的引擎二进制（失败 reject 中文错误）。
+  importEngineBinary: (backend: Backend, path: string) =>
+    invoke<BinaryStatus>("import_engine_binary", { backend, path }),
 
   // M2: servers / import / diagnosis
   listServers: () => invoke<ServerConfig[]>("list_servers"),

@@ -54,14 +54,12 @@ fn data_dir(app: &AppHandle) -> PathBuf {
     })
 }
 
-
 /// One-time migration: copy every keychain secret we can address from the
 /// local config files (tunnels + servers) into the SQLite secret store.
 /// Reading the keychain may show ONE final authorization prompt; after this
 /// the app never touches the keychain again.
 fn migrate_keychain_secrets(app: &AppHandle) {
     use crate::servers_store as ss;
-
 
     // Direct keyring reads — the ss::/cloudflare:: helpers now read the
     // SQLite store, so the migration must go to the source itself.
@@ -82,7 +80,11 @@ fn migrate_keychain_secrets(app: &AppHandle) {
             ss::frps_token_account(&srv.id),
         ] {
             if let Some(v) = legacy_get(&account) {
-                if crate::secrets_store::try_get(&account).ok().flatten().is_none() {
+                if crate::secrets_store::try_get(&account)
+                    .ok()
+                    .flatten()
+                    .is_none()
+                {
                     let _ = crate::secrets_store::set(&account, &v);
                     migrated += 1;
                 }
@@ -102,7 +104,11 @@ fn migrate_keychain_secrets(app: &AppHandle) {
                 ];
                 for account in entries {
                     if let Some(v) = legacy_get(&account) {
-                        if crate::secrets_store::try_get(&account).ok().flatten().is_none() {
+                        if crate::secrets_store::try_get(&account)
+                            .ok()
+                            .flatten()
+                            .is_none()
+                        {
                             let _ = crate::secrets_store::set(&account, &v);
                             migrated += 1;
                         }
@@ -132,8 +138,7 @@ fn migrate_legacy_data_dir(app: &AppHandle) {
     if new_dir.join("tunnels.json").exists() || new_dir.join("servers.json").exists() {
         return;
     }
-    let Some(legacy_dir) = dirs::data_dir().map(|d| d.join(crate::brand::LEGACY_IDENTIFIER))
-    else {
+    let Some(legacy_dir) = dirs::data_dir().map(|d| d.join(crate::brand::LEGACY_IDENTIFIER)) else {
         return;
     };
     if !legacy_dir.exists() {
@@ -157,7 +162,10 @@ fn migrate_legacy_data_dir(app: &AppHandle) {
             if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 let _ = copy_dir_all(&entry.path(), &target);
             } else if let Err(e2) = std::fs::copy(entry.path(), &target) {
-                eprintln!("[pier] migrate {}: {e} / copy: {e2}", entry.path().display());
+                eprintln!(
+                    "[pier] migrate {}: {e} / copy: {e2}",
+                    entry.path().display()
+                );
             }
         }
     }
@@ -319,10 +327,7 @@ pub async fn delete_tunnel(state: State<'_, AppState>, id: String) -> Result<(),
 }
 
 #[tauri::command]
-pub async fn start_tunnel(
-    state: State<'_, AppState>,
-    id: String,
-) -> Result<TunnelState, String> {
+pub async fn start_tunnel(state: State<'_, AppState>, id: String) -> Result<TunnelState, String> {
     let cfg = state
         .store
         .get(&id)?
@@ -363,7 +368,12 @@ pub fn list_states(state: State<'_, AppState>) -> Vec<TunnelState> {
         .store
         .load()
         .into_iter()
-        .map(|t| state.engine.snapshot(&t.id).unwrap_or_else(|| TunnelState::new(&t.id)))
+        .map(|t| {
+            state
+                .engine
+                .snapshot(&t.id)
+                .unwrap_or_else(|| TunnelState::new(&t.id))
+        })
         .collect()
 }
 
@@ -385,21 +395,32 @@ pub async fn install_binary(
     backend: Backend,
     state: State<'_, AppState>,
 ) -> Result<BinaryStatus, String> {
-    // The download flow belongs to the system-integration milestone and the
-    // stub currently errors. Report the outcome in logs, but always answer
-    // with the fresh binary status so the UI can render it.
     // 下载 ~40MB 引擎包：阻塞体放专用线程池，避免冻住 UI（原实现同步
     // recv，主线程被拖住几十秒）。
+    // 诚实化：下载/解包/探测失败必须如实把错误返回给前端（binman::install
+    // 的 Err 是中文信息，内含已尝试的下载源列表与手动导入建议），不再吞错
+    // 假装成功；成功才返回最新状态（前端以 installed 字段判定）。
     let app = state.app.clone();
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        if let Err(e) = crate::binman::install(&app, backend) {
-            eprintln!("[pier] install {backend:?} engine failed: {e}");
-        }
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::binman::install(&app, backend)?;
         crate::binman::read_status(&app)
     })
     .await
-    .map_err(|e| format!("install_binary task failed: {e}"))?;
-    result
+    .map_err(|e| format!("install_binary task failed: {e}"))?
+}
+
+/// 手动导入引擎二进制：设置页通过 dialog 选择文件后调用。
+/// 校验（路径/平台魔数/--version 探测）与复制、换装都在阻塞线程池执行。
+#[tauri::command]
+pub async fn import_engine_binary(
+    state: State<'_, AppState>,
+    backend: Backend,
+    path: String,
+) -> Result<BinaryStatus, String> {
+    let app = state.app.clone();
+    tauri::async_runtime::spawn_blocking(move || crate::binman::import_binary(&app, backend, &path))
+        .await
+        .map_err(|e| format!("import_engine_binary task failed: {e}"))?
 }
 
 // ---------------------------------------------------------------------------
@@ -485,9 +506,7 @@ pub async fn deploy_server(app: AppHandle, id: String) -> Result<DeployResult, S
         .find(|s| s.id == id)
         .ok_or_else(|| "server not found".to_string())?;
     let handle = tauri::async_runtime::spawn(crate::frp_deploy::deploy(app.clone(), server));
-    handle
-        .await
-        .map_err(|e| format!("deploy task failed: {e}"))
+    handle.await.map_err(|e| format!("deploy task failed: {e}"))
 }
 
 #[tauri::command]
@@ -505,7 +524,9 @@ pub async fn get_server_status(app: AppHandle, id: String) -> Result<ServerStatu
         .into_iter()
         .find(|s| s.id == id)
         .ok_or_else(|| "server not found".to_string())?;
-    let frps_running = crate::frp_deploy::status(&app, server.clone()).await.unwrap_or(false);
+    let frps_running = crate::frp_deploy::status(&app, server.clone())
+        .await
+        .unwrap_or(false);
     Ok(ServerStatus {
         server_id: id,
         reachable: true,
@@ -516,7 +537,10 @@ pub async fn get_server_status(app: AppHandle, id: String) -> Result<ServerStatu
 }
 
 #[tauri::command]
-pub fn import_frpc_config(text: String, server_id: Option<String>) -> Result<Vec<TunnelConfig>, String> {
+pub fn import_frpc_config(
+    text: String,
+    server_id: Option<String>,
+) -> Result<Vec<TunnelConfig>, String> {
     crate::frp_import::parse_frpc_config(&text, server_id.as_deref())
 }
 
@@ -524,7 +548,11 @@ pub fn import_frpc_config(text: String, server_id: Option<String>) -> Result<Vec
 pub fn diagnose_tunnel(state: State<'_, AppState>, id: String) -> Result<Diagnosis, String> {
     let snap = state.engine.snapshot(&id).ok_or("tunnel not found")?;
     let logs = state.engine.recent_logs(&id, 200);
-    Ok(crate::diagnostics::diagnose(&id, snap.error.as_deref(), &logs))
+    Ok(crate::diagnostics::diagnose(
+        &id,
+        snap.error.as_deref(),
+        &logs,
+    ))
 }
 
 /// 打开日志面板时拉取历史：从引擎环形缓冲回放结构化日志（最老在前），

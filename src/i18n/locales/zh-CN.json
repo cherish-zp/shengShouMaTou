@@ -454,6 +454,9 @@
     "installing": "安装中…",
     "installFailed": "引擎安装失败",
     "installSuccess": "引擎安装完成",
+    "importBinary": "手动导入",
+    "importSuccess": "{{name}} 导入成功",
+    "importFailed": "导入失败",
     "loadFailed": "加载引擎状态失败",
     "storage": {
       "title": "存储占用",
