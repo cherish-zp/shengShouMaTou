@@ -1,6 +1,6 @@
 [package]
 name = "pier"
-version = "0.6.0"
+version = "0.7.0"
 description = "An open-source, polished desktop tunneling tool — expose local ports to the internet in one click."
 authors = ["cherish-zp"]
 license = "MIT"
